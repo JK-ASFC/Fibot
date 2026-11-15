@@ -79,6 +79,45 @@ INDICES = {"CAC 40": "^FCHI", "S&P 500": "^GSPC", "Nasdaq": "^IXIC",
            "Bitcoin": "BTC-EUR", "Or": "GC=F", "VIX": "^VIX"}
 TAUX_10ANS = "^TNX"   # taux US 10 ans : quand il monte, l'immobilier coté souffre
 
+# Noms lisibles pour les alertes (un ticker absent s'affiche tel quel)
+NOMS = {
+    "AAPL": "Apple", "MSFT": "Microsoft", "GOOGL": "Alphabet (Google)", "AMZN": "Amazon",
+    "META": "Meta (Facebook)", "ASML.AS": "ASML", "SAP.DE": "SAP",
+    "NVDA": "Nvidia", "AMD": "AMD", "TSM": "TSMC", "AVGO": "Broadcom", "PLTR": "Palantir",
+    "MU": "Micron",
+    "RIO": "Rio Tinto", "BHP": "BHP", "FCX": "Freeport-McMoRan", "ALB": "Albemarle",
+    "AI.PA": "Air Liquide", "MT.AS": "ArcelorMittal",
+    "TTE.PA": "TotalEnergies", "XOM": "ExxonMobil", "ENPH": "Enphase", "NEE": "NextEra Energy",
+    "BTC-EUR": "Bitcoin", "ETH-EUR": "Ethereum", "SOL-EUR": "Solana", "BNB-EUR": "BNB",
+    "XRP-EUR": "XRP", "ADA-EUR": "Cardano", "AVAX-EUR": "Avalanche", "LINK-EUR": "Chainlink",
+    "DOT-EUR": "Polkadot",
+    "URW.PA": "Unibail-Rodamco-Westfield", "LI.PA": "Klépierre", "GFC.PA": "Gecina",
+    "COV.PA": "Covivio", "ICAD.PA": "Icade", "MERY.PA": "Mercialys", "VNA.DE": "Vonovia",
+    "O": "Realty Income", "PLD": "Prologis", "VNQ": "ETF immobilier américain (Vanguard)",
+    "CW8.PA": "ETF Monde (Amundi MSCI World)", "ESE.PA": "ETF S&P 500 (BNP Paribas)",
+    "PUST.PA": "ETF Nasdaq-100 (Amundi)",
+}
+INDICES_EXPL = {"CAC 40": "grandes entreprises françaises",
+                "S&P 500": "grandes entreprises américaines",
+                "Nasdaq": "technologie américaine", "Bitcoin": "première crypto",
+                "Or": "valeur refuge"}
+PLACES_EURO = (".PA", ".AS", ".DE", ".MI", ".MC", ".BR", ".LS", ".F", ".VI", ".HE", ".IR")
+
+
+def nom(t: str) -> str:
+    """« **Apple** (`AAPL`) » si le nom est connu, sinon « **TICKER** »."""
+    return f"**{NOMS[t]}** (`{t}`)" if t in NOMS else f"**{t}**"
+
+
+def devise(t: str) -> str:
+    """Devise de cotation, déduite du symbole Yahoo ; vide si on ne sait pas."""
+    if t.endswith("-EUR") or t.endswith(PLACES_EURO):
+        return "€"
+    if t.endswith("-USD") or t.isalpha():
+        return "$"
+    return ""
+
+
 LEGAL_COURT = "Signal automatique générique • Pas un conseil personnalisé • Risque de perte en capital • /legal"
 
 
@@ -263,11 +302,14 @@ def analyse(df: pd.DataFrame, k: str = "action", ctx: dict | None = None) -> dic
         rendement = float(df["Dividends"].fillna(0).tail(252).sum()) / price
 
     score, why = 0, []
+    plus, moins = [], []       # les mêmes raisons, en langage courant, pour les alertes
     if not np.isnan(sma200):
         if price > sma200:
             score += 20; why.append("✅ Au-dessus de la moyenne 200 j (tendance longue haussière)")
+            plus.append("la tendance de fond est à la hausse depuis plusieurs mois")
         else:
             score -= 20; why.append("❌ Sous la moyenne 200 j (tendance longue baissière)")
+            moins.append("la tendance de fond est à la baisse depuis plusieurs mois")
         if sma50 > sma200:
             score += 15; why.append("✅ Moyenne 50 j > 200 j")
         else:
@@ -277,19 +319,25 @@ def analyse(df: pd.DataFrame, k: str = "action", ctx: dict | None = None) -> dic
 
     if rsi < 30:
         score += 25; why.append(f"✅ RSI {rsi:.0f} : survendu, rebond possible")
+        plus.append("le cours a beaucoup baissé ces derniers jours, un rebond est possible")
     elif rsi < 45:
         score += 10; why.append(f"✅ RSI {rsi:.0f} : repli, point d'entrée correct")
+        plus.append("le cours vient de reculer un peu, ce qui donne un prix d'entrée correct")
     elif rsi > 80:
         score -= 30; why.append(f"❌ RSI {rsi:.0f} : très suracheté")
+        moins.append("le cours est monté beaucoup trop vite, le risque de rechute est élevé")
     elif rsi > 70:
         score -= 20; why.append(f"❌ RSI {rsi:.0f} : suracheté")
+        moins.append("le cours est monté très vite, une pause ou un recul est probable")
     else:
         why.append(f"➖ RSI {rsi:.0f} : neutre")
 
     if h_now > 0 and h_now > h_prev:
         score += 15; why.append("✅ MACD positif et en hausse")
+        plus.append("l'élan des derniers jours est positif et se renforce")
     elif h_now < 0 and h_now < h_prev:
         score -= 15; why.append("❌ MACD négatif et en baisse")
+        moins.append("l'élan des derniers jours est négatif et s'aggrave")
     elif h_now > h_prev:
         score += 5; why.append("➖ MACD en redressement")
     else:
@@ -297,16 +345,20 @@ def analyse(df: pd.DataFrame, k: str = "action", ctx: dict | None = None) -> dic
 
     if mom3m > 0.10:
         score += 10; why.append(f"✅ {mom3m:+.0%} sur 3 mois")
+        plus.append(f"il a gagné {abs(mom3m):.0%} en 3 mois")
     elif mom3m < -0.10:
         score -= 10; why.append(f"❌ {mom3m:+.0%} sur 3 mois")
+        moins.append(f"il a perdu {abs(mom3m):.0%} en 3 mois")
 
     # --- facteurs propres à la crypto : sentiment de marché (contrarien)
     if k == "crypto" and ctx.get("fng"):
         v, lab = ctx["fng"]
         if v <= 25:
             score += 10; why.append(f"✅ Sentiment crypto : {lab} ({v}/100), zone historiquement favorable")
+            plus.append("les investisseurs crypto ont très peur, ce qui a souvent été un bon moment pour acheter")
         elif v >= 75:
             score -= 10; why.append(f"❌ Sentiment crypto : {lab} ({v}/100), marché euphorique")
+            moins.append("le marché crypto est euphorique, ce qui précède souvent une baisse")
         else:
             why.append(f"➖ Sentiment crypto : {lab} ({v}/100)")
     # --- facteurs propres à l'immobilier coté : taux d'intérêt et rendement
@@ -315,8 +367,10 @@ def analyse(df: pd.DataFrame, k: str = "action", ctx: dict | None = None) -> dic
         if t is not None:
             if t <= -0.30:
                 score += 10; why.append(f"✅ Taux 10 ans en baisse ({pts(t)} pt sur 3 mois) : favorable à l'immobilier")
+                plus.append("les taux d'intérêt baissent, ce qui aide l'immobilier")
             elif t >= 0.30:
                 score -= 10; why.append(f"❌ Taux 10 ans en hausse ({pts(t)} pt sur 3 mois) : pèse sur l'immobilier")
+                moins.append("les taux d'intérêt montent, ce qui pénalise l'immobilier")
         if rendement >= 0.05 and not np.isnan(sma200) and price > sma200:
             score += 5
         if rendement > 0:
@@ -343,7 +397,8 @@ def analyse(df: pd.DataFrame, k: str = "action", ctx: dict | None = None) -> dic
             "decision": f"{emoji} {label}", "montant": montant, "rsi": rsi, "vol": vol,
             "mom3m": mom3m, "why": why, "stop": price - 2 * atr, "objectif": price + 3 * atr,
             "rendement": rendement, "sma50": close.rolling(50).mean(),
-            "sma200": close.rolling(200).mean(), "rsi_s": rsi_s, "kind": k}
+            "sma200": close.rolling(200).mean(), "rsi_s": rsi_s, "kind": k,
+            "plus": plus, "moins": moins}
 
 
 async def classement(tickers: list[str]) -> list[tuple[str, dict]]:
@@ -366,6 +421,10 @@ def fmt(x: float) -> str:
 
 def pct(x: float) -> str:
     return f"{x:+.1%}".replace(".", ",").replace("-", "−")
+
+
+def prix(x: float, d: str = "") -> str:
+    return f"{fmt(x)} {d}".strip()
 
 
 def pts(x: float) -> str:
@@ -501,37 +560,144 @@ def embed_analyse(ticker: str, a: dict) -> discord.Embed:
     return e
 
 
-def ligne(t: str, a: dict) -> str:
-    l = f"{ICONE[a['kind']]} **{t}**  `{jauge(a['score'])}`  **{a['score']:+d}**\n"
-    if a["montant"] > 0:
-        l += f"╰ **{a['montant']:.0f} €** à ~{fmt(a['price'])} · stop {fmt(a['stop'])}"
-        if a["kind"] == "immo" and a["rendement"] > 0:
-            l += " · rdt " + f"{a['rendement']:.1%}".replace(".", ",")
-    else:
-        l += f"╰ {a['decision']} · cours {fmt(a['price'])}"
-    return l
+def note(score: int) -> str:
+    return f"{score:+d}/100".replace("-", "−")
 
 
-async def humeur() -> str:
-    """Ligne de météo du marché : variation du jour des indices + sentiment crypto."""
+def signaux(n: int, sens: str) -> str:
+    return f"**{n} {'signal' if n == 1 else 'signaux'} {sens}**"
+
+
+def bloc_achat(t: str, a: dict) -> str:
+    """Un signal d'achat expliqué pas à pas : combien, à quel prix, quand sortir, pourquoi."""
+    d, p = devise(t), a["price"]
+    l = [f"{ICONE[a['kind']]} {nom(t)}",
+         f"{a['emoji']} **Signal d'{'achat fort' if a['score'] >= 40 else 'achat'}** · "
+         f"note {note(a['score'])}",
+         f"💶 Mise indicative : **{a['montant']:.0f} €**",
+         f"📍 Cours actuel : **{prix(p, d)}** ({pct(a['mom3m'])} en 3 mois)",
+         f"🛑 Stop : **{prix(a['stop'], d)}** ({pct(a['stop'] / p - 1)}) → revendre si le cours "
+         "descend jusque-là",
+         f"🎯 Objectif : **{prix(a['objectif'], d)}** ({pct(a['objectif'] / p - 1)}) → encaisser "
+         "le gain à ce niveau"]
+    if a["kind"] == "immo" and a["rendement"] > 0:
+        l.append("💰 Dividende : " + f"{a['rendement']:.1%}".replace(".", ",")
+                 + " par an (revenu versé aux actionnaires)")
+    if a["plus"]:
+        l.append("💡 Pourquoi : " + " ; ".join(a["plus"][:3]) + ".")
+    if a["moins"]:
+        l.append("⚠️ À surveiller : " + " ; ".join(a["moins"][:2]) + ".")
+    return "\n".join(l)
+
+
+def bloc_vente(t: str, a: dict) -> str:
+    fort = a["score"] <= -40
+    l = [f"{ICONE[a['kind']]} {nom(t)}",
+         f"{a['emoji']} **{'Signal de vente' if fort else "Signal d'allègement"}** · "
+         f"note {note(a['score'])} → "
+         + ("vendre la position" if fort else "en vendre une partie"),
+         f"📍 Cours actuel : **{prix(a['price'], devise(t))}** ({pct(a['mom3m'])} en 3 mois)"]
+    if a["moins"]:
+        l.append("💡 Pourquoi : " + " ; ".join(a["moins"][:3]) + ".")
+    return "\n".join(l)
+
+
+async def embed_marche(titre: str, n_achats: int, n_ventes: int) -> discord.Embed:
+    """Premier message : résumé en une phrase, puis l'évolution des marchés expliquée."""
     data, ctx = await get_data(list(INDICES.values())), await get_ctx()
-    parts = []
-    for nom, t in INDICES.items():
-        if t in data and nom != "VIX":
-            c = data[t]["Close"]
-            v = float(c.iloc[-1] / c.iloc[-2] - 1)
-            parts.append(f"{'🟢' if v >= 0 else '🔴'} {nom} **{pct(v)}**")
-    txt = "  ·  ".join(parts)
+    now = dt.datetime.now(PARIS)
+    if n_achats and n_ventes:
+        bref = (f"{signaux(n_achats, "d'achat")} et {signaux(n_ventes, 'de vente')}. "
+                "Le détail est dans les messages suivants.")
+    elif n_achats:
+        bref = f"{signaux(n_achats, "d'achat")}, aucun signal de vente. Détail juste en dessous."
+    elif n_ventes:
+        bref = (f"**Rien à acheter**, et {signaux(n_ventes, 'de vente')} si tu possèdes "
+                "ces actifs. Détail juste en dessous.")
+    else:
+        bref = "**Rien à faire aujourd'hui** : aucun actif ne déclenche de signal."
+    e = discord.Embed(color=0x5865F2, title=f"📊  {titre}",
+                      description=f"**{date_fr(now)}**\n\n📌 **En bref** : {bref}")
+
+    lignes, sens = [], []
+    for nom_i, t in INDICES.items():
+        if t not in data or nom_i == "VIX":
+            continue
+        c = data[t]["Close"]
+        j, m = float(c.iloc[-1] / c.iloc[-2] - 1), float(c.iloc[-1] / c.iloc[-22] - 1)
+        if nom_i in ("CAC 40", "S&P 500", "Nasdaq"):
+            sens.append(j >= 0)
+        lignes.append(f"{'🟢' if j >= 0 else '🔴'} **{nom_i}** ({INDICES_EXPL[nom_i]}) : "
+                      f"**{pct(j)}** sur la dernière séance, {pct(m)} sur un mois")
+    if lignes:
+        if sens and all(sens):
+            lignes.append("➜ Séance positive pour les bourses.")
+        elif sens and not any(sens):
+            lignes.append("➜ Séance négative pour les bourses.")
+        elif sens:
+            lignes.append("➜ Séance contrastée : pas de direction nette.")
+        e.add_field(name="🌍  Évolution des marchés", value="\n".join(lignes), inline=False)
+
+    climat = []
     if ctx.get("fng"):
-        txt += f"\n🌡️ Sentiment crypto : **{ctx['fng'][1]}** ({ctx['fng'][0]}/100)"
+        v, lab = ctx["fng"]
+        expl = ("les investisseurs ont très peur. Ces périodes ont souvent été de bons moments "
+                "pour acheter, mais les prix peuvent encore baisser" if v <= 25 else
+                "les investisseurs sont inquiets" if v < 45 else
+                "ni peur ni euphorie" if v <= 55 else
+                "les investisseurs sont confiants" if v < 75 else
+                "le marché est euphorique, ce qui précède souvent une baisse")
+        climat.append(f"🌡️ **Crypto : {lab}** ({v}/100) → {expl}.")
     if ctx.get("taux") is not None:
-        sens = "en baisse 📉" if ctx["taux"] < -0.1 else "en hausse 📈" if ctx["taux"] > 0.1 else "stables"
-        txt += f"\n🏦 Taux 10 ans {sens} ({pts(ctx['taux'])} pt sur 3 mois)"
-    return txt
+        t = ctx["taux"]
+        if t > 0.1:
+            climat.append(f"🏦 **Taux d'intérêt en hausse** ({pts(t)} pt en 3 mois) → emprunter "
+                          "coûte plus cher, c'est défavorable à l'immobilier coté.")
+        elif t < -0.1:
+            climat.append(f"🏦 **Taux d'intérêt en baisse** ({pts(t)} pt en 3 mois) → emprunter "
+                          "coûte moins cher, c'est favorable à l'immobilier coté.")
+        else:
+            climat.append("🏦 **Taux d'intérêt stables** → pas d'effet particulier sur l'immobilier coté.")
+    if climat:
+        e.add_field(name="🧭  Climat", value="\n".join(climat), inline=False)
+    if now.weekday() >= 5:
+        e.add_field(name="ℹ️  Week-end", inline=False, value=(
+            "Les bourses sont fermées : pour les actions, ce sont les chiffres de vendredi, et un "
+            "ordre passé maintenant ne serait exécuté qu'à la réouverture lundi. Seules les "
+            "cryptos cotent en continu."))
+    e.set_footer(text=LEGAL_COURT)
+    return e
+
+
+LEXIQUE = (
+    "**Note** : de −100 à +100, synthèse de plusieurs indicateurs. À partir de +20 : signal "
+    "d'achat. En dessous de −20 : signal de vente. Entre les deux : attendre.\n"
+    "**Mise indicative** : montant suggéré, jamais plus de {budget:.0f} € par achat. Si une action "
+    "coûte plus cher que la mise, il faut un courtier qui permet d'acheter une fraction d'action. "
+    "Les cours en $ sont convertis en euros par le courtier.\n"
+    "**Stop** : prix plancher fixé à l'avance. S'il est atteint, on revend pour limiter la perte.\n"
+    "**Objectif** : prix visé pour encaisser son gain.\n"
+    "**Pas de signal** : ne rien faire est une décision normale, et la plus fréquente.")
+
+
+def _pages(blocs: list[str], limite: int = 3800) -> list[str]:
+    """Assemble des blocs en une ou plusieurs descriptions, sous la limite d'un embed Discord."""
+    pages, page = [], ""
+    for b in blocs:
+        b = b[:limite]
+        if page and len(page) + len(b) + 2 > limite:
+            pages.append(page)
+            page = ""
+        page += ("\n\n" if page else "") + b
+    return pages + [page] if page else pages
 
 
 async def build_alerte(titre: str, tickers: list[str]):
-    """Construit l'alerte complète : embed, image, menu interactif."""
+    """
+    Construit l'alerte en trois messages (parfois quatre) : évolution des marchés, quoi
+    acheter, quoi vendre.
+    Renvoie (messages, vue, achats), où messages est une liste de (embed, fichier ou None).
+    """
     res = await classement(tickers)
     data = await get_data(tickers)
     achats = [(t, a) for t, a in res if a["montant"] > 0]
@@ -540,31 +706,69 @@ async def build_alerte(titre: str, tickers: list[str]):
     def top(kinds, n):
         return [(t, a) for t, a in achats if a["kind"] in kinds][:n]
 
-    e = discord.Embed(color=0x5865F2, title=f"📊  {titre}",
-                      description=f"**{date_fr(dt.datetime.now(PARIS))}**\n{await humeur()}\n​")
-    sections = [("📈  Actions & ETF", top(("action", "etf"), 3)),
-                ("🪙  Crypto", top(("crypto",), 2)),
-                ("🏠  Immobilier coté", top(("immo",), 2))]
-    montres = []
-    for nom, lst in sections:
-        if lst:
-            e.add_field(name=nom, value="\n".join(ligne(t, a) for t, a in lst), inline=False)
-            montres += lst
-    if not montres:
-        e.add_field(name="⏸️  Aucun signal d'achat", inline=False,
-                    value="Aucun actif ne passe les critères. Ne rien faire est aussi une décision.")
-    if ventes:
-        e.add_field(name="🔻  À alléger / vendre", inline=False,
-                    value="\n".join(ligne(t, a) for t, a in ventes))
-    e.set_footer(text=f"Max {BUDGET_MAX:.0f} € par achat • {LEGAL_COURT}")
+    sections = [("📈  ACTIONS & ETF", top(("action", "etf"), 3)),
+                ("🪙  CRYPTO", top(("crypto",), 2)),
+                ("🏠  IMMOBILIER COTÉ", top(("immo",), 2))]
+    montres = [x for _, lst in sections for x in lst]
+    messages = [(await embed_marche(titre, len(montres), len(ventes)), None)]
 
-    fichier = None
+    # --- quoi acheter
     if montres:
+        blocs = ["Chaque fiche dit **combien** miser, **à quel prix** et **quand sortir**. "
+                 "Rien n'oblige à tout suivre : un seul achat à la fois suffit."]
+        for nom_s, lst in sections:
+            if lst:
+                blocs.append(f"__**{nom_s}**__")
+                blocs += [bloc_achat(t, a) for t, a in lst]
+        pages = _pages(blocs)
+        for k, page in enumerate(pages[:-1]):      # rare : trop de signaux pour un seul message
+            e = discord.Embed(color=0x23A55A, description=page,
+                              title="✅  Quoi faire : les signaux d'achat" + (" (suite)" if k else ""))
+            e.set_footer(text=LEGAL_COURT)
+            messages.append((e, None))
+        e = discord.Embed(color=0x23A55A, description=pages[-1],
+                          title="✅  Quoi faire : les signaux d'achat"
+                                + (" (suite)" if len(pages) > 1 else ""))
         buf = await asyncio.to_thread(chart_top, [(t, a, data[t]) for t, a in montres])
         fichier = discord.File(buf, filename="top.png")
         e.set_image(url="attachment://top.png")
+    else:
+        e, fichier = discord.Embed(
+            color=0xF0B232, title="⏸️  Quoi faire : rien à acheter",
+            description="Aucun actif suivi ne remplit les critères d'achat aujourd'hui. "
+                        "Ne rien faire est aussi une décision : mieux vaut attendre un bon "
+                        "signal que d'acheter par impatience."), None
+    e.set_footer(text=f"Max {BUDGET_MAX:.0f} € par achat • {LEGAL_COURT}")
+    messages.append((e, fichier))
+
+    # --- quoi vendre + aide à la lecture
+    if ventes:
+        blocs = ["**Ne te concerne que si tu possèdes déjà ces actifs.** Si tu n'en as pas : "
+                 "rien à faire, simplement éviter d'en acheter pour l'instant."]
+        blocs += [bloc_vente(t, a) for t, a in ventes]
+        e = discord.Embed(color=0xF23F43, title="🔻  Si tu en possèdes : à vendre ou alléger",
+                          description=_pages(blocs)[0])
+    else:
+        e = discord.Embed(color=0x4E5058, title="🔻  Rien à vendre",
+                          description="Aucun actif suivi ne déclenche de signal de vente.")
+    e.add_field(name="📖  Comment lire ces alertes", inline=False,
+                value=LEXIQUE.format(budget=BUDGET_MAX))
+    e.set_footer(text=LEGAL_COURT)
+    messages.append((e, None))
+
     vue = AlerteView([(t, a) for t, a in montres + ventes])
-    return e, fichier, vue, achats
+    return messages, vue, achats
+
+
+async def envoyer_alerte(send, messages, vue=None) -> None:
+    """Envoie les messages dans l'ordre ; le menu interactif va sous le dernier."""
+    for i, (e, fichier) in enumerate(messages):
+        kw = {"embed": e}
+        if fichier:
+            kw["file"] = fichier
+        if vue is not None and i == len(messages) - 1:
+            kw["view"] = vue
+        await send(**kw)
 
 
 def embed_legal() -> discord.Embed:
@@ -787,8 +991,9 @@ async def analyse_cmd(inter: discord.Interaction, ticker: str):
 async def top(inter: discord.Interaction, theme: app_commands.Choice[str] | None = None):
     await inter.response.defer()
     tickers = THEMES[theme.value] if theme else all_tickers()
-    e, f, vue, _ = await build_alerte(f"Signaux — {theme.value if theme else 'tous thèmes'}", tickers)
-    await inter.followup.send(embed=e, view=vue, **({"file": f} if f else {}))
+    messages, vue, _ = await build_alerte(
+        f"Signaux — {theme.value if theme else 'tous thèmes'}", tickers)
+    await envoyer_alerte(inter.followup.send, messages, vue)
 
 
 @bot.tree.command(description="Météo des marchés : indices, or, bitcoin, sentiment, taux")
@@ -1070,10 +1275,10 @@ async def alertes():
     now = dt.datetime.now(PARIS)
     crypto_seule = now.weekday() >= 5 or now.hour >= 20
     try:
-        e, f, vue, achats = await build_alerte(
+        messages, vue, achats = await build_alerte(
             "Point crypto" if crypto_seule else "Signaux du marché",
             THEMES["crypto"] if crypto_seule else all_tickers())
-        await chan.send(embed=e, view=vue, **({"file": f} if f else {}))
+        await envoyer_alerte(chan.send, messages, vue)
         d, limite = load(), (today() - dt.timedelta(days=7)).isoformat()
         for t, a in achats:      # journal pour /performance, un signal par actif et par semaine
             if not any(x["ticker"] == t and x["date"] >= limite for x in d["journal"]):
