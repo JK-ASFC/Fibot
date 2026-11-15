@@ -1,0 +1,944 @@
+"""
+Bot Discord de signaux de marché : actions, ETF, crypto, immobilier coté.
+
+Outil d'information automatisé. Les signaux sont génériques, calculés par des
+règles techniques publiques (voir README). Ce n'est PAS un conseil en
+investissement personnalisé. Risque de perte en capital.
+"""
+import asyncio
+import datetime as dt
+import io
+import json
+import os
+import time
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import aiohttp
+import discord
+import matplotlib
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from discord import app_commands
+from discord.ext import tasks
+from dotenv import load_dotenv
+
+matplotlib.use("Agg")
+from matplotlib.dates import DateFormatter  # noqa: E402
+from matplotlib.figure import Figure  # noqa: E402
+
+load_dotenv()
+TOKEN = os.getenv("DISCORD_TOKEN")
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))      # salon des alertes
+GUILD_ID = int(os.getenv("GUILD_ID", "0"))          # optionnel : commandes dispo tout de suite
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))          # si renseigné : bot privé, toi seul peux l'utiliser
+BUDGET_MAX = float(os.getenv("BUDGET_MAX", "50"))   # euros max par achat
+TAUX_PFU = float(os.getenv("TAUX_PFU", "31.4"))     # flat tax en %, à vérifier chaque année
+PARIS = ZoneInfo("Europe/Paris")
+DATA_FILE = Path(__file__).with_name("data.json")
+
+# ---------------------------------------------------------------- univers suivi
+# Tickers au format Yahoo Finance. Un ticker introuvable est simplement ignoré.
+THEMES = {
+    "tech": ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "ASML.AS", "SAP.DE"],
+    "ia": ["NVDA", "AMD", "TSM", "AVGO", "PLTR", "MU"],
+    "materiaux": ["RIO", "BHP", "FCX", "ALB", "AI.PA", "MT.AS"],
+    "energie": ["TTE.PA", "XOM", "ENPH", "NEE"],
+    "crypto": ["BTC-EUR", "ETH-EUR", "SOL-EUR", "BNB-EUR", "XRP-EUR",
+               "ADA-EUR", "AVAX-EUR", "LINK-EUR", "DOT-EUR"],
+    # Foncières cotées (SIIC / REIT) : de l'immobilier accessible dès quelques euros
+    "immobilier": ["URW.PA", "LI.PA", "GFC.PA", "COV.PA", "ICAD.PA", "MERY.PA",
+                   "VNA.DE", "O", "PLD", "VNQ"],
+    "etf": ["CW8.PA", "ESE.PA", "PUST.PA"],
+}
+INDICES = {"CAC 40": "^FCHI", "S&P 500": "^GSPC", "Nasdaq": "^IXIC",
+           "Bitcoin": "BTC-EUR", "Or": "GC=F", "VIX": "^VIX"}
+TAUX_10ANS = "^TNX"   # taux US 10 ans : quand il monte, l'immobilier coté souffre
+
+LEGAL_COURT = "Signal automatique générique • Pas un conseil personnalisé • Risque de perte en capital • /legal"
+
+
+# ---------------------------------------------------------------- stockage
+def load() -> dict:
+    d = json.loads(DATA_FILE.read_text()) if DATA_FILE.exists() else {}
+    for k, v in (("consent", {}), ("positions", {}), ("alertes", []),
+                 ("journal", []), ("watch", [])):
+        d.setdefault(k, v)
+    return d
+
+
+def save(d: dict) -> None:
+    DATA_FILE.write_text(json.dumps(d, indent=2, ensure_ascii=False))
+
+
+def all_tickers() -> list[str]:
+    return sorted({t for lst in THEMES.values() for t in lst} | set(load()["watch"]))
+
+
+def kind(t: str) -> str:
+    if t.endswith(("-EUR", "-USD")):
+        return "crypto"
+    if t in THEMES["immobilier"]:
+        return "immo"
+    return "etf" if t in THEMES["etf"] else "action"
+
+
+# ---------------------------------------------------------------- données
+_cache: dict[str, tuple[float, pd.DataFrame]] = {}
+_ctx_cache: tuple[float, dict] = (0.0, {})
+CACHE_TTL = 15 * 60
+
+
+def _download(tickers: list[str]) -> dict[str, pd.DataFrame]:
+    data = yf.download(tickers, period="2y", interval="1d", group_by="ticker",
+                       auto_adjust=True, actions=True, progress=False, threads=True)
+    out = {}
+    for t in tickers:
+        try:
+            df = data[t] if isinstance(data.columns, pd.MultiIndex) else data
+            df = df.dropna(subset=["Close"])
+        except KeyError:
+            continue
+        if len(df) >= 60:
+            out[t] = df
+    return out
+
+
+async def get_data(tickers: list[str]) -> dict[str, pd.DataFrame]:
+    now = time.time()
+    tickers = list(dict.fromkeys(t.upper() for t in tickers))
+    missing = [t for t in tickers if t not in _cache or now - _cache[t][0] > CACHE_TTL]
+    if missing:
+        try:
+            fresh = await asyncio.to_thread(_download, missing)
+        except Exception as exc:
+            print("Téléchargement impossible :", exc)
+            fresh = {}
+        for t, df in fresh.items():
+            _cache[t] = (now, df)
+    return {t: _cache[t][1] for t in tickers if t in _cache}
+
+
+FNG_FR = {"Extreme Fear": "Peur extrême", "Fear": "Peur", "Neutral": "Neutre",
+          "Greed": "Avidité", "Extreme Greed": "Avidité extrême"}
+
+
+async def get_ctx() -> dict:
+    """Contexte de marché : sentiment crypto (Fear & Greed) et tendance des taux."""
+    global _ctx_cache
+    if time.time() - _ctx_cache[0] < 3600:
+        return _ctx_cache[1]
+    ctx = {"fng": None, "taux": None}
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
+            async with s.get("https://api.alternative.me/fng/?limit=1") as r:
+                d = (await r.json(content_type=None))["data"][0]
+                ctx["fng"] = (int(d["value"]), FNG_FR.get(d["value_classification"],
+                                                           d["value_classification"]))
+    except Exception as exc:
+        print("Fear & Greed indisponible :", exc)
+    tnx = (await get_data([TAUX_10ANS])).get(TAUX_10ANS)
+    if tnx is not None and len(tnx) > 63:
+        ctx["taux"] = float(tnx["Close"].iloc[-1] - tnx["Close"].iloc[-63])
+    _ctx_cache = (time.time(), ctx)
+    return ctx
+
+
+# ---------------------------------------------------------------- analyse
+def analyse(df: pd.DataFrame, k: str = "action", ctx: dict | None = None) -> dict:
+    """Score de -100 à +100, décision, mise indicative et raisons."""
+    ctx = ctx or {}
+    close = df["Close"].astype(float)
+    price = float(close.iloc[-1])
+    sma50 = float(close.rolling(50).mean().iloc[-1])
+    sma200 = float(close.rolling(200).mean().iloc[-1]) if len(close) >= 200 else float("nan")
+
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    rsi_s = (100 - 100 / (1 + gain / loss.replace(0, np.nan))).fillna(100)
+    rsi = float(rsi_s.iloc[-1])
+
+    macd = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
+    hist = macd - macd.ewm(span=9, adjust=False).mean()
+    h_now, h_prev = float(hist.iloc[-1]), float(hist.iloc[-4])
+
+    mom3m = price / float(close.iloc[-63]) - 1 if len(close) > 63 else 0.0
+    vol = float(close.pct_change().tail(60).std() * np.sqrt(252))
+    drawdown = price / float(close.tail(252).max()) - 1
+
+    tr = pd.concat([df["High"] - df["Low"], (df["High"] - close.shift()).abs(),
+                    (df["Low"] - close.shift()).abs()], axis=1).max(axis=1)
+    atr = float(tr.rolling(14).mean().iloc[-1])
+
+    rendement = 0.0
+    if "Dividends" in df:
+        rendement = float(df["Dividends"].fillna(0).tail(252).sum()) / price
+
+    score, why = 0, []
+    if not np.isnan(sma200):
+        if price > sma200:
+            score += 20; why.append("✅ Au-dessus de la moyenne 200 j (tendance longue haussière)")
+        else:
+            score -= 20; why.append("❌ Sous la moyenne 200 j (tendance longue baissière)")
+        if sma50 > sma200:
+            score += 15; why.append("✅ Moyenne 50 j > 200 j")
+        else:
+            score -= 15; why.append("❌ Moyenne 50 j < 200 j")
+    else:
+        why.append("ℹ️ Historique trop court pour la moyenne 200 j")
+
+    if rsi < 30:
+        score += 25; why.append(f"✅ RSI {rsi:.0f} : survendu, rebond possible")
+    elif rsi < 45:
+        score += 10; why.append(f"✅ RSI {rsi:.0f} : repli, point d'entrée correct")
+    elif rsi > 80:
+        score -= 30; why.append(f"❌ RSI {rsi:.0f} : très suracheté")
+    elif rsi > 70:
+        score -= 20; why.append(f"❌ RSI {rsi:.0f} : suracheté")
+    else:
+        why.append(f"➖ RSI {rsi:.0f} : neutre")
+
+    if h_now > 0 and h_now > h_prev:
+        score += 15; why.append("✅ MACD positif et en hausse")
+    elif h_now < 0 and h_now < h_prev:
+        score -= 15; why.append("❌ MACD négatif et en baisse")
+    elif h_now > h_prev:
+        score += 5; why.append("➖ MACD en redressement")
+    else:
+        score -= 5; why.append("➖ MACD en essoufflement")
+
+    if mom3m > 0.10:
+        score += 10; why.append(f"✅ {mom3m:+.0%} sur 3 mois")
+    elif mom3m < -0.10:
+        score -= 10; why.append(f"❌ {mom3m:+.0%} sur 3 mois")
+
+    # --- facteurs propres à la crypto : sentiment de marché (contrarien)
+    if k == "crypto" and ctx.get("fng"):
+        v, lab = ctx["fng"]
+        if v <= 25:
+            score += 10; why.append(f"✅ Sentiment crypto : {lab} ({v}/100), zone historiquement favorable")
+        elif v >= 75:
+            score -= 10; why.append(f"❌ Sentiment crypto : {lab} ({v}/100), marché euphorique")
+        else:
+            why.append(f"➖ Sentiment crypto : {lab} ({v}/100)")
+    # --- facteurs propres à l'immobilier coté : taux d'intérêt et rendement
+    if k == "immo":
+        t = ctx.get("taux")
+        if t is not None:
+            if t <= -0.30:
+                score += 10; why.append(f"✅ Taux 10 ans en baisse ({pts(t)} pt sur 3 mois) : favorable à l'immobilier")
+            elif t >= 0.30:
+                score -= 10; why.append(f"❌ Taux 10 ans en hausse ({pts(t)} pt sur 3 mois) : pèse sur l'immobilier")
+        if rendement >= 0.05 and not np.isnan(sma200) and price > sma200:
+            score += 5
+        if rendement > 0:
+            why.append("💰 Rendement du dividende sur 12 mois : " + f"{rendement:.1%}".replace(".", ","))
+    if drawdown < -0.30:
+        why.append(f"ℹ️ {drawdown:.0%} sous son plus haut d'un an")
+
+    score = int(max(-100, min(100, score)))
+    if score >= 40:
+        emoji, label, part = "🟢", "ACHAT FORT", 1.0
+    elif score >= 20:
+        emoji, label, part = "🟢", "ACHAT", 0.6
+    elif score > -20:
+        emoji, label, part = "🟡", "ATTENDRE", 0.0
+    elif score > -40:
+        emoji, label, part = "🟠", "ALLÉGER", 0.0
+    else:
+        emoji, label, part = "🔴", "VENDRE", 0.0
+    if vol > 0.60:          # actif très volatil : mise réduite
+        part *= 0.6
+    montant = round(BUDGET_MAX * part / 5) * 5
+
+    return {"price": price, "score": score, "emoji": emoji, "label": label,
+            "decision": f"{emoji} {label}", "montant": montant, "rsi": rsi, "vol": vol,
+            "mom3m": mom3m, "why": why, "stop": price - 2 * atr, "objectif": price + 3 * atr,
+            "rendement": rendement, "sma50": close.rolling(50).mean(),
+            "sma200": close.rolling(200).mean(), "rsi_s": rsi_s, "kind": k}
+
+
+async def classement(tickers: list[str]) -> list[tuple[str, dict]]:
+    data, ctx = await get_data(tickers), await get_ctx()
+    res = [(t, analyse(df, kind(t), ctx)) for t, df in data.items()]
+    return sorted(res, key=lambda x: x[1]["score"], reverse=True)
+
+
+# ---------------------------------------------------------------- mise en forme
+JOURS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+MOIS = ["janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.",
+        "oct.", "nov.", "déc."]
+ICONE = {"crypto": "🪙", "immo": "🏠", "etf": "🧺", "action": "📈"}
+
+
+def fmt(x: float) -> str:
+    s = f"{x:,.2f}" if abs(x) >= 1 else f"{x:.4f}"
+    return s.replace(",", " ").replace(".", ",")
+
+
+def pct(x: float) -> str:
+    return f"{x:+.1%}".replace(".", ",").replace("-", "−")
+
+
+def pts(x: float) -> str:
+    return f"{x:+.2f}".replace(".", ",").replace("-", "−")
+
+
+def jauge(score: int) -> str:
+    n = round((score + 100) / 20)
+    return "▰" * n + "▱" * (10 - n)
+
+
+def couleur(score: int) -> int:
+    return 0x23A55A if score >= 20 else 0xF23F43 if score <= -20 else 0xF0B232
+
+
+def date_fr(d: dt.datetime) -> str:
+    return f"{JOURS[d.weekday()].capitalize()} {d.day} {MOIS[d.month - 1]} • {d:%H:%M}"
+
+
+# ---------------------------------------------------------------- graphiques
+BG, PANEL, GRID = "#1e1f22", "#2b2d31", "#3a3c42"
+TXT, MUTED = "#f2f3f5", "#949ba4"
+C_GREEN, C_RED, C_YEL, C_BLUE, C_VIOLET = "#23a55a", "#f23f43", "#f0b232", "#5865f2", "#b48cf2"
+
+
+def _hex(score: int) -> str:
+    return C_GREEN if score >= 20 else C_RED if score <= -20 else C_YEL
+
+
+def _style(ax):
+    ax.set_facecolor(PANEL)
+    for s in ax.spines.values():
+        s.set_visible(False)
+    ax.tick_params(colors=MUTED, labelsize=9, length=0)
+    ax.grid(color=GRID, linewidth=0.6, alpha=0.7)
+    ax.yaxis.tick_right()
+
+
+def _png(fig) -> io.BytesIO:
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=160, facecolor=BG)
+    buf.seek(0)
+    return buf
+
+
+def chart_analyse(ticker: str, df: pd.DataFrame, a: dict) -> io.BytesIO:
+    n = 180
+    close = df["Close"].astype(float).tail(n)
+    col = _hex(a["score"])
+    fig = Figure(figsize=(9, 5.4))
+    gs = fig.add_gridspec(2, 1, height_ratios=[3.2, 1], hspace=0.08,
+                          left=0.03, right=0.92, top=0.84, bottom=0.07)
+    ax, ax2 = fig.add_subplot(gs[0]), fig.add_subplot(gs[1])
+    _style(ax); _style(ax2)
+
+    ax.plot(close.index, close, color=col, linewidth=2.2, zorder=3)
+    ax.fill_between(close.index, close, close.min() * 0.98, color=col, alpha=0.12)
+    ax.plot(close.index, a["sma50"].tail(n), color=C_BLUE, linewidth=1.2, label="Moy. 50 j")
+    ax.plot(close.index, a["sma200"].tail(n), color=C_VIOLET, linewidth=1.2,
+            linestyle="--", label="Moy. 200 j")
+    if a["montant"] > 0:
+        ax.axhline(a["stop"], color=C_RED, linewidth=1, linestyle=":")
+        ax.axhline(a["objectif"], color=C_GREEN, linewidth=1, linestyle=":")
+        ax.text(close.index[0], a["stop"], " Stop", color=C_RED, fontsize=8, va="bottom")
+        ax.text(close.index[0], a["objectif"], " Objectif", color=C_GREEN, fontsize=8, va="bottom")
+    ax.scatter([close.index[-1]], [close.iloc[-1]], color=col, s=45, zorder=4,
+               edgecolors=BG, linewidths=1.5)
+    ax.legend(loc="lower right", frameon=False, labelcolor=MUTED, fontsize=8, ncols=2)
+    ax.set_xticklabels([])
+    ax.margins(x=0.01)
+
+    rsi = a["rsi_s"].tail(n)
+    ax2.plot(rsi.index, rsi, color=TXT, linewidth=1.2)
+    ax2.axhspan(70, 100, color=C_RED, alpha=0.12)
+    ax2.axhspan(0, 30, color=C_GREEN, alpha=0.12)
+    ax2.set_ylim(0, 100); ax2.set_yticks([30, 70])
+    ax2.xaxis.set_major_formatter(DateFormatter("%d/%m"))
+    ax2.margins(x=0.01)
+    ax2.text(0.005, 0.82, "RSI 14", transform=ax2.transAxes, color=MUTED, fontsize=8)
+
+    fig.text(0.03, 0.925, ticker, color=TXT, fontsize=20, fontweight="bold")
+    fig.text(0.03, 0.875, f"{fmt(a['price'])}   {pct(a['mom3m'])} sur 3 mois",
+             color=MUTED, fontsize=10)
+    fig.text(0.92, 0.925, a["label"], color=col, fontsize=17, fontweight="bold", ha="right")
+    fig.text(0.92, 0.875, f"Score {a['score']:+d} / 100", color=MUTED, fontsize=10, ha="right")
+    return _png(fig)
+
+
+def chart_top(items: list[tuple[str, dict, pd.DataFrame]]) -> io.BytesIO:
+    """Planche de mini-cartes : une par opportunité."""
+    items = items[:6]
+    cols = 3 if len(items) > 2 else max(len(items), 1)
+    rows = (len(items) + cols - 1) // cols
+    fig = Figure(figsize=(3.3 * cols, 2.3 * rows))
+    fig.subplots_adjust(left=0.02, right=0.98, top=0.97, bottom=0.03, wspace=0.06, hspace=0.1)
+    for i, (t, a, df) in enumerate(items):
+        ax = fig.add_subplot(rows, cols, i + 1)
+        ax.set_facecolor(PANEL)
+        for s in ax.spines.values():
+            s.set_visible(False)
+        ax.set_xticks([]); ax.set_yticks([])
+        c = df["Close"].astype(float).tail(90).to_numpy()
+        col = _hex(a["score"])
+        x = np.arange(len(c))
+        lo, hi = c.min(), c.max()
+        y = (c - lo) / (hi - lo or 1) * 0.5 + 0.06     # courbe dans la moitié basse
+        ax.plot(x, y, color=col, linewidth=2)
+        ax.fill_between(x, y, 0, color=col, alpha=0.15)
+        ax.set_ylim(0, 1.05); ax.set_xlim(0, len(c) - 1)
+        ax.text(0.06, 0.86, t, transform=ax.transAxes, color=TXT, fontsize=14, fontweight="bold")
+        ax.text(0.94, 0.87, pct(a["mom3m"]), transform=ax.transAxes, fontsize=10, ha="right",
+                color=C_GREEN if a["mom3m"] >= 0 else C_RED)
+        sub = a["label"] + (f"  •  {a['montant']:.0f} €" if a["montant"] else "")
+        ax.text(0.06, 0.72, sub, transform=ax.transAxes, color=col, fontsize=9.5, fontweight="bold")
+    return _png(fig)
+
+
+# ---------------------------------------------------------------- embeds
+def embed_analyse(ticker: str, a: dict) -> discord.Embed:
+    e = discord.Embed(color=couleur(a["score"]),
+                      title=f"{ICONE[a['kind']]}  {ticker}  ·  {a['decision']}",
+                      description=f"`{jauge(a['score'])}`  **{a['score']:+d} / 100**\n\n"
+                                  + "\n".join(a["why"]))
+    e.add_field(name="Cours", value=f"**{fmt(a['price'])}**")
+    e.add_field(name="3 mois", value=pct(a["mom3m"]))
+    e.add_field(name="Volatilité", value=f"{a['vol']:.0%} / an")
+    if a["montant"] > 0:
+        e.add_field(name="💶 Mise indicative", value=f"**{a['montant']:.0f} €**")
+        e.add_field(name="🛑 Stop", value=fmt(a["stop"]))
+        e.add_field(name="🎯 Objectif", value=fmt(a["objectif"]))
+    e.set_image(url="attachment://analyse.png")
+    e.set_footer(text=LEGAL_COURT)
+    return e
+
+
+def ligne(t: str, a: dict) -> str:
+    l = f"{ICONE[a['kind']]} **{t}**  `{jauge(a['score'])}`  **{a['score']:+d}**\n"
+    if a["montant"] > 0:
+        l += f"╰ **{a['montant']:.0f} €** à ~{fmt(a['price'])} · stop {fmt(a['stop'])}"
+        if a["kind"] == "immo" and a["rendement"] > 0:
+            l += " · rdt " + f"{a['rendement']:.1%}".replace(".", ",")
+    else:
+        l += f"╰ {a['decision']} · cours {fmt(a['price'])}"
+    return l
+
+
+async def humeur() -> str:
+    """Ligne de météo du marché : variation du jour des indices + sentiment crypto."""
+    data, ctx = await get_data(list(INDICES.values())), await get_ctx()
+    parts = []
+    for nom, t in INDICES.items():
+        if t in data and nom != "VIX":
+            c = data[t]["Close"]
+            v = float(c.iloc[-1] / c.iloc[-2] - 1)
+            parts.append(f"{'🟢' if v >= 0 else '🔴'} {nom} **{pct(v)}**")
+    txt = "  ·  ".join(parts)
+    if ctx.get("fng"):
+        txt += f"\n🌡️ Sentiment crypto : **{ctx['fng'][1]}** ({ctx['fng'][0]}/100)"
+    if ctx.get("taux") is not None:
+        sens = "en baisse 📉" if ctx["taux"] < -0.1 else "en hausse 📈" if ctx["taux"] > 0.1 else "stables"
+        txt += f"\n🏦 Taux 10 ans {sens} ({pts(ctx['taux'])} pt sur 3 mois)"
+    return txt
+
+
+async def build_alerte(titre: str, tickers: list[str]):
+    """Construit l'alerte complète : embed, image, menu interactif."""
+    res = await classement(tickers)
+    data = await get_data(tickers)
+    achats = [(t, a) for t, a in res if a["montant"] > 0]
+    ventes = [(t, a) for t, a in reversed(res) if a["score"] <= -20][:4]
+
+    def top(kinds, n):
+        return [(t, a) for t, a in achats if a["kind"] in kinds][:n]
+
+    e = discord.Embed(color=0x5865F2, title=f"📊  {titre}",
+                      description=f"**{date_fr(dt.datetime.now(PARIS))}**\n{await humeur()}\n​")
+    sections = [("📈  Actions & ETF", top(("action", "etf"), 3)),
+                ("🪙  Crypto", top(("crypto",), 2)),
+                ("🏠  Immobilier coté", top(("immo",), 2))]
+    montres = []
+    for nom, lst in sections:
+        if lst:
+            e.add_field(name=nom, value="\n".join(ligne(t, a) for t, a in lst), inline=False)
+            montres += lst
+    if not montres:
+        e.add_field(name="⏸️  Aucun signal d'achat", inline=False,
+                    value="Aucun actif ne passe les critères. Ne rien faire est aussi une décision.")
+    if ventes:
+        e.add_field(name="🔻  À alléger / vendre", inline=False,
+                    value="\n".join(ligne(t, a) for t, a in ventes))
+    e.set_footer(text=f"Max {BUDGET_MAX:.0f} € par achat • {LEGAL_COURT}")
+
+    fichier = None
+    if montres:
+        buf = await asyncio.to_thread(chart_top, [(t, a, data[t]) for t, a in montres])
+        fichier = discord.File(buf, filename="top.png")
+        e.set_image(url="attachment://top.png")
+    vue = AlerteView([(t, a) for t, a in montres + ventes])
+    return e, fichier, vue, achats
+
+
+def embed_legal() -> discord.Embed:
+    e = discord.Embed(title="⚖️  Mentions légales et avertissements", color=0x4E5058)
+    e.add_field(name="Nature du service", inline=False, value=(
+        "Outil d'information automatisé. Les signaux sont **génériques** : ils résultent de "
+        "règles techniques publiques (moyennes mobiles, RSI, MACD, momentum, sentiment, taux) "
+        "appliquées à l'identique pour tous. Ils ne tiennent compte ni de ta situation "
+        "financière, ni de tes objectifs, ni de ta tolérance au risque. Ce n'est **pas un "
+        "conseil en investissement personnalisé**. L'exploitant du bot n'est ni conseiller en "
+        "investissements financiers (CIF), ni prestataire agréé, et n'est pas enregistré "
+        "auprès de l'AMF ou de l'ORIAS."))
+    e.add_field(name="Risques", inline=False, value=(
+        "Investir comporte un **risque de perte en capital**, partielle ou totale. Les "
+        "performances passées ne préjugent pas des performances futures. Les crypto-actifs "
+        "sont très volatils. N'investis que l'argent dont tu n'as pas besoin. Tu restes seul "
+        "responsable de tes décisions."))
+    e.add_field(name="Transparence", inline=False, value=(
+        "L'exploitant du bot peut détenir les actifs cités. Aucune rémunération n'est perçue "
+        "des émetteurs ou plateformes. Données : Yahoo Finance (possiblement différées, usage "
+        "personnel) et alternative.me. Elles peuvent contenir des erreurs."))
+    e.add_field(name="Tes données (RGPD)", inline=False, value=(
+        "Le bot enregistre localement ton identifiant Discord, ton acceptation, tes positions "
+        "et tes alertes de prix, uniquement pour fonctionner. `/mesdonnees` pour les "
+        "consulter, `/supprimer` pour tout effacer."))
+    e.add_field(name="Avant d'investir", inline=False, value=(
+        "Vérifie que ta plateforme est autorisée (listes blanches et noires de l'AMF sur "
+        "amf-france.org). Service réservé aux personnes majeures."))
+    return e
+
+
+# ---------------------------------------------------------------- vues interactives
+def autorise(inter: discord.Interaction) -> bool:
+    return not OWNER_ID or inter.user.id == OWNER_ID
+
+
+async def envoyer_analyse(inter: discord.Interaction, ticker: str, ephemeral: bool):
+    data = await get_data([ticker])
+    if ticker not in data:
+        return await inter.followup.send(
+            f"Ticker `{ticker}` introuvable ou historique insuffisant.", ephemeral=ephemeral)
+    a = analyse(data[ticker], kind(ticker), await get_ctx())
+    buf = await asyncio.to_thread(chart_analyse, ticker, data[ticker], a)
+    await inter.followup.send(embed=embed_analyse(ticker, a), ephemeral=ephemeral,
+                              file=discord.File(buf, filename="analyse.png"))
+
+
+class AlerteView(discord.ui.View):
+    def __init__(self, items: list[tuple[str, dict]] = ()):
+        super().__init__(timeout=None)
+        opts = [discord.SelectOption(label=t, emoji=a["emoji"],
+                                     description=f"{a['label']} · score {a['score']:+d}")
+                for t, a in items[:25]] or [discord.SelectOption(label="—")]
+        sel = discord.ui.Select(custom_id="sig:detail", options=opts,
+                                placeholder="🔎 Voir le détail et le graphique d'un actif")
+        sel.callback = self.detail
+        self.add_item(sel)
+        btn = discord.ui.Button(label="Mentions légales", emoji="⚖️", custom_id="sig:legal",
+                                style=discord.ButtonStyle.secondary)
+        btn.callback = self.legal
+        self.add_item(btn)
+        self.add_item(discord.ui.Button(label="Vérifier une plateforme (AMF)",
+                                        url="https://www.amf-france.org"))
+
+    async def detail(self, inter: discord.Interaction):
+        if not autorise(inter):
+            return await inter.response.send_message("Bot privé.", ephemeral=True)
+        ticker = inter.data["values"][0]
+        await inter.response.defer(ephemeral=True, thinking=True)
+        await envoyer_analyse(inter, ticker, ephemeral=True)
+
+    async def legal(self, inter: discord.Interaction):
+        await inter.response.send_message(embed=embed_legal(), ephemeral=True)
+
+
+class ConsentView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="J'ai lu et j'accepte", emoji="✅", custom_id="consent:ok",
+                       style=discord.ButtonStyle.success)
+    async def ok(self, inter: discord.Interaction, _):
+        d = load()
+        d["consent"][str(inter.user.id)] = dt.datetime.now(PARIS).isoformat(timespec="seconds")
+        save(d)
+        await inter.response.edit_message(
+            content="✅ Conditions acceptées. Relance ta commande.", embed=None, view=None)
+
+
+class Tree(app_commands.CommandTree):
+    """Contrôle d'accès : bot privé (OWNER_ID) + acceptation des mentions légales."""
+
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        if not autorise(inter):
+            await inter.response.send_message("Ce bot est privé.", ephemeral=True)
+            return False
+        nom = inter.command.name if inter.command else ""
+        if nom in ("legal", "supprimer") or str(inter.user.id) in load()["consent"]:
+            return True
+        await inter.response.send_message(
+            content="Avant la première utilisation, lis et accepte ces conditions :",
+            embed=embed_legal(), view=ConsentView(), ephemeral=True)
+        return False
+
+
+# ---------------------------------------------------------------- bot
+class Bot(discord.Client):
+    def __init__(self):
+        super().__init__(intents=discord.Intents.default())
+        self.tree = Tree(self)
+
+    async def setup_hook(self):
+        self.add_view(AlerteView())
+        self.add_view(ConsentView())
+        if GUILD_ID:
+            g = discord.Object(id=GUILD_ID)
+            self.tree.copy_global_to(guild=g)
+            await self.tree.sync(guild=g)
+        else:
+            await self.tree.sync()
+        if CHANNEL_ID:
+            alertes.start()
+            surveillance.start()
+
+    async def on_ready(self):
+        print(f"Connecté : {self.user}")
+
+
+bot = Bot()
+THEME_CHOICES = [app_commands.Choice(name=k, value=k) for k in THEMES]
+
+
+@bot.tree.command(name="analyse", description="Analyse complète d'un actif avec graphique")
+@app_commands.describe(ticker="Symbole Yahoo Finance, ex : NVDA, TTE.PA, BTC-EUR, URW.PA")
+async def analyse_cmd(inter: discord.Interaction, ticker: str):
+    await inter.response.defer()
+    await envoyer_analyse(inter, ticker.upper().strip(), ephemeral=False)
+
+
+@bot.tree.command(description="Les meilleurs signaux du moment, tous thèmes ou un seul")
+@app_commands.choices(theme=THEME_CHOICES)
+async def top(inter: discord.Interaction, theme: app_commands.Choice[str] | None = None):
+    await inter.response.defer()
+    tickers = THEMES[theme.value] if theme else all_tickers()
+    e, f, vue, _ = await build_alerte(f"Signaux — {theme.value if theme else 'tous thèmes'}", tickers)
+    await inter.followup.send(embed=e, view=vue, **({"file": f} if f else {}))
+
+
+@bot.tree.command(description="Météo des marchés : indices, or, bitcoin, sentiment, taux")
+async def marche(inter: discord.Interaction):
+    await inter.response.defer()
+    data = await get_data(list(INDICES.values()))
+    e = discord.Embed(title="🌍  Météo des marchés", color=0x5865F2,
+                      description=f"**{date_fr(dt.datetime.now(PARIS))}**")
+    for nom, t in INDICES.items():
+        if t in data:
+            c = data[t]["Close"]
+            j, m = float(c.iloc[-1] / c.iloc[-2] - 1), float(c.iloc[-1] / c.iloc[-22] - 1)
+            e.add_field(name=f"{'🟢' if j >= 0 else '🔴'} {nom}",
+                        value=f"**{fmt(float(c.iloc[-1]))}**\nJour {pct(j)}\nMois {pct(m)}")
+    ctx = await get_ctx()
+    if ctx.get("fng"):
+        e.add_field(name="🌡️ Sentiment crypto", inline=False,
+                    value=f"`{jauge(ctx['fng'][0] * 2 - 100)}`  **{ctx['fng'][1]}** ({ctx['fng'][0]}/100)")
+    e.set_footer(text=LEGAL_COURT)
+    await inter.followup.send(embed=e)
+
+
+@bot.tree.command(description="Simule un investissement mensuel régulier (DCA) sur 2 ans")
+@app_commands.describe(ticker="Symbole", mensuel="Montant investi chaque mois en €")
+async def dca(inter: discord.Interaction, ticker: str, mensuel: float = 50.0):
+    await inter.response.defer()
+    ticker = ticker.upper().strip()
+    data = await get_data([ticker])
+    if ticker not in data:
+        return await inter.followup.send(f"Ticker `{ticker}` introuvable.")
+    mensuel = min(max(mensuel, 1), BUDGET_MAX)
+    close = data[ticker]["Close"].astype(float)
+    achats = close.groupby([close.index.year, close.index.month]).first()
+    investi = mensuel * len(achats)
+    valeur = float((mensuel / achats).sum() * close.iloc[-1])
+    e = discord.Embed(title=f"🗓️  DCA sur {ticker}", color=couleur(40 if valeur >= investi else -40),
+                      description=f"**{mensuel:.0f} € par mois** pendant {len(achats)} mois, "
+                                  "achetés le premier jour de cotation du mois.")
+    e.add_field(name="Investi", value=f"{investi:.0f} €")
+    e.add_field(name="Valeur aujourd'hui", value=f"**{valeur:.0f} €**")
+    e.add_field(name="Résultat", value=f"{valeur - investi:+.0f} € ({pct(valeur / investi - 1)})")
+    e.set_footer(text="Simulation sur le passé, hors frais et impôts. " + LEGAL_COURT)
+    await inter.followup.send(embed=e)
+
+
+@bot.tree.command(description="Enregistre un achat pour suivre ta position")
+@app_commands.describe(ticker="Symbole", prix="Prix d'achat unitaire", montant="Montant investi en €")
+async def achat(inter: discord.Interaction, ticker: str, prix: float, montant: float):
+    if montant > BUDGET_MAX:
+        return await inter.response.send_message(
+            f"Ta règle : {BUDGET_MAX:.0f} € max par achat. Achat non enregistré.", ephemeral=True)
+    if prix <= 0 or montant <= 0:
+        return await inter.response.send_message("Prix et montant doivent être positifs.", ephemeral=True)
+    d = load()
+    d["positions"].setdefault(str(inter.user.id), []).append(
+        {"ticker": ticker.upper().strip(), "prix": prix, "montant": montant,
+         "date": dt.date.today().isoformat()})
+    save(d)
+    await inter.response.send_message(
+        f"✅ Achat noté : {montant:.0f} € de {ticker.upper()} à {fmt(prix)}.", ephemeral=True)
+
+
+@bot.tree.command(description="Retire une position (vendue)")
+async def vente(inter: discord.Interaction, ticker: str):
+    d, uid, t = load(), str(inter.user.id), ticker.upper().strip()
+    avant = len(d["positions"].get(uid, []))
+    d["positions"][uid] = [x for x in d["positions"].get(uid, []) if x["ticker"] != t]
+    save(d)
+    await inter.response.send_message(
+        f"✅ {t} retiré." if len(d["positions"][uid]) < avant else f"Aucune position sur {t}.",
+        ephemeral=True)
+
+
+def etat_position(pnl: float, a: dict) -> str:
+    if pnl <= -0.15:
+        return "🔴 VENDRE · perte > 15 %, règle de coupe"
+    if a["score"] <= -40:
+        return "🔴 VENDRE · signal très négatif"
+    if pnl >= 0.20 and a["rsi"] > 75:
+        return "🟠 SÉCURISER LA MOITIÉ · suracheté"
+    if a["score"] <= -20:
+        return "🟠 ALLÉGER"
+    if a["montant"] > 0:
+        return f"🟢 CONSERVER · renfort possible {a['montant']:.0f} €"
+    return "🟡 CONSERVER"
+
+
+@bot.tree.command(description="Tes positions : gain/perte, signal et impôt estimé")
+async def positions(inter: discord.Interaction):
+    await inter.response.defer(ephemeral=True)
+    mine = load()["positions"].get(str(inter.user.id), [])
+    if not mine:
+        return await inter.followup.send("Aucune position. Utilise `/achat` après chaque achat.")
+    data, ctx = await get_data([x["ticker"] for x in mine]), await get_ctx()
+    lignes, total, valeur = [], 0.0, 0.0
+    for x in mine:
+        total += x["montant"]
+        if x["ticker"] not in data:
+            valeur += x["montant"]
+            lignes.append(f"**{x['ticker']}** · données indisponibles")
+            continue
+        a = analyse(data[x["ticker"]], kind(x["ticker"]), ctx)
+        pnl = a["price"] / x["prix"] - 1
+        valeur += x["montant"] * (1 + pnl)
+        lignes.append(f"{ICONE[a['kind']]} **{x['ticker']}** · {x['montant']:.0f} € → "
+                      f"**{pct(pnl)}**\n╰ {etat_position(pnl, a)}")
+    gain = valeur - total
+    e = discord.Embed(title="💼  Tes positions", description="\n".join(lignes),
+                      color=couleur(40 if gain >= 0 else -40))
+    e.add_field(name="Investi", value=f"{total:.0f} €")
+    e.add_field(name="Valeur", value=f"**{valeur:.0f} €**")
+    e.add_field(name="Résultat", value=f"{gain:+.0f} € ({pct(valeur / total - 1)})")
+    if gain > 0:
+        e.add_field(name="Impôt estimé si tu vends tout", inline=False,
+                    value=f"~{gain * TAUX_PFU / 100:.0f} € (flat tax {TAUX_PFU:g} %, hors PEA). Voir `/fiscalite`.")
+    e.set_footer(text=LEGAL_COURT)
+    await inter.followup.send(embed=e)
+
+
+@bot.tree.command(description="Crée une alerte de prix : le bot te prévient quand le seuil est franchi")
+@app_commands.describe(ticker="Symbole", seuil="Prix à surveiller")
+async def alerte(inter: discord.Interaction, ticker: str, seuil: float):
+    await inter.response.defer(ephemeral=True)
+    ticker = ticker.upper().strip()
+    data = await get_data([ticker])
+    if ticker not in data:
+        return await inter.followup.send(f"Ticker `{ticker}` introuvable.")
+    prix = float(data[ticker]["Close"].iloc[-1])
+    d = load()
+    d["alertes"].append({"uid": inter.user.id, "ticker": ticker, "seuil": seuil,
+                         "sens": "haut" if seuil > prix else "bas"})
+    save(d)
+    await inter.followup.send(
+        f"🔔 Alerte créée : {ticker} {'≥' if seuil > prix else '≤'} {fmt(seuil)} (cours actuel {fmt(prix)}).")
+
+
+@bot.tree.command(description="Ajoute un actif à la liste suivie par les alertes")
+async def suivre(inter: discord.Interaction, ticker: str):
+    await inter.response.defer(ephemeral=True)
+    ticker = ticker.upper().strip()
+    if ticker not in await get_data([ticker]):
+        return await inter.followup.send(f"Ticker `{ticker}` introuvable.")
+    d = load()
+    if ticker not in d["watch"]:
+        d["watch"].append(ticker); save(d)
+    await inter.followup.send(f"✅ {ticker} est maintenant suivi.")
+
+
+@bot.tree.command(description="Bilan des signaux d'achat passés du bot : ont-ils vraiment marché ?")
+async def performance(inter: discord.Interaction):
+    await inter.response.defer()
+    j = load()["journal"]
+    if not j:
+        return await inter.followup.send("Pas encore d'historique : il se remplit à chaque alerte automatique.")
+    data = await get_data([x["ticker"] for x in j])
+    perfs = [(x, float(data[x["ticker"]]["Close"].iloc[-1]) / x["prix"] - 1)
+             for x in j if x["ticker"] in data]
+    if not perfs:
+        return await inter.followup.send("Données indisponibles pour le moment.")
+    vals = [p for _, p in perfs]
+    best, worst = max(perfs, key=lambda x: x[1]), min(perfs, key=lambda x: x[1])
+    moy = float(np.mean(vals))
+    e = discord.Embed(title="🧾  Bilan des signaux d'achat", color=couleur(40 if moy >= 0 else -40),
+                      description=f"{len(perfs)} signaux depuis le {j[0]['date']}")
+    e.add_field(name="Performance moyenne", value=f"**{pct(moy)}**")
+    e.add_field(name="Signaux gagnants", value=f"{sum(v > 0 for v in vals) / len(vals):.0%}")
+    e.add_field(name="​", value="​")
+    e.add_field(name="Meilleur", value=f"{best[0]['ticker']} {pct(best[1])}")
+    e.add_field(name="Pire", value=f"{worst[0]['ticker']} {pct(worst[1])}")
+    e.set_footer(text="Affiché tel quel, bons et mauvais signaux compris. " + LEGAL_COURT)
+    await inter.followup.send(embed=e)
+
+
+@bot.tree.command(description="Estimation de l'impôt sur une plus-value (France)")
+@app_commands.describe(gain="Plus-value réalisée en €")
+async def fiscalite(inter: discord.Interaction, gain: float):
+    e = discord.Embed(title="🧮  Fiscalité des plus-values (France)", color=0x4E5058)
+    e.add_field(name="Estimation", inline=False,
+                value=f"Gain de {gain:.0f} € → impôt ~**{max(gain, 0) * TAUX_PFU / 100:.0f} €** "
+                      f"au prélèvement forfaitaire unique de {TAUX_PFU:g} %.")
+    e.add_field(name="À savoir", inline=False, value=(
+        "• **Compte-titres** : flat tax sur les gains nets de l'année (moins-values déductibles).\n"
+        "• **PEA** : pas d'impôt sur le revenu après 5 ans, prélèvements sociaux seulement.\n"
+        "• **Crypto** : imposée à la conversion en euros, pas lors d'un échange crypto contre "
+        "crypto. Petites cessions annuelles exonérées sous un seuil. Comptes sur plateformes "
+        "étrangères à déclarer.\n"
+        "• Tout se déclare chaque année avec ta déclaration de revenus."))
+    e.set_footer(text="Estimation indicative, pas un conseil fiscal. Règles et taux à vérifier sur impots.gouv.fr.")
+    await inter.response.send_message(embed=e, ephemeral=True)
+
+
+@bot.tree.command(description="Mentions légales, risques et données personnelles")
+async def legal(inter: discord.Interaction):
+    await inter.response.send_message(embed=embed_legal(), ephemeral=True)
+
+
+@bot.tree.command(description="Affiche toutes les données que le bot conserve sur toi")
+async def mesdonnees(inter: discord.Interaction):
+    d, uid = load(), str(inter.user.id)
+    export = {"acceptation": d["consent"].get(uid), "positions": d["positions"].get(uid, []),
+              "alertes": [a for a in d["alertes"] if a["uid"] == inter.user.id]}
+    buf = io.BytesIO(json.dumps(export, indent=2, ensure_ascii=False).encode())
+    await inter.response.send_message("Voici tes données :", ephemeral=True,
+                                      file=discord.File(buf, filename="mes_donnees.json"))
+
+
+@bot.tree.command(description="Efface toutes tes données (positions, alertes, acceptation)")
+async def supprimer(inter: discord.Interaction):
+    d, uid = load(), str(inter.user.id)
+    d["consent"].pop(uid, None); d["positions"].pop(uid, None)
+    d["alertes"] = [a for a in d["alertes"] if a["uid"] != inter.user.id]
+    save(d)
+    await inter.response.send_message("🗑️ Toutes tes données ont été effacées.", ephemeral=True)
+
+
+@bot.tree.command(description="Liste des thèmes et actifs suivis")
+async def themes(inter: discord.Interaction):
+    e = discord.Embed(title="🗂️  Actifs suivis", color=0x5865F2)
+    for k, v in THEMES.items():
+        e.add_field(name=k.capitalize(), value=" · ".join(f"`{t}`" for t in v), inline=False)
+    perso = load()["watch"]
+    if perso:
+        e.add_field(name="Ajoutés avec /suivre", value=" · ".join(f"`{t}`" for t in perso), inline=False)
+    await inter.response.send_message(embed=e)
+
+
+@bot.tree.command(description="Toutes les commandes du bot")
+async def aide(inter: discord.Interaction):
+    e = discord.Embed(title="📖  Commandes", color=0x5865F2, description=(
+        "**Signaux**\n`/top` · `/analyse` · `/marche` · `/themes` · `/suivre`\n\n"
+        "**Ton portefeuille**\n`/achat` · `/vente` · `/positions` · `/alerte`\n\n"
+        "**Outils**\n`/dca` · `/performance` · `/fiscalite`\n\n"
+        "**Légal et données**\n`/legal` · `/mesdonnees` · `/supprimer`"))
+    await inter.response.send_message(embed=e, ephemeral=True)
+
+
+# ---------------------------------------------------------------- tâches automatiques
+@tasks.loop(time=[dt.time(9, 15, tzinfo=PARIS), dt.time(15, 45, tzinfo=PARIS),
+                  dt.time(20, 30, tzinfo=PARIS)])
+async def alertes():
+    """9h15 ouverture Paris, 15h45 ouverture US, 20h30 point crypto. Week-end : crypto seule."""
+    chan = bot.get_channel(CHANNEL_ID)
+    if chan is None:
+        return
+    now = dt.datetime.now(PARIS)
+    crypto_seule = now.weekday() >= 5 or now.hour >= 20
+    try:
+        e, f, vue, achats = await build_alerte(
+            "Point crypto" if crypto_seule else "Signaux du marché",
+            THEMES["crypto"] if crypto_seule else all_tickers())
+        await chan.send(embed=e, view=vue, **({"file": f} if f else {}))
+        d, limite = load(), (dt.date.today() - dt.timedelta(days=7)).isoformat()
+        for t, a in achats:      # journal pour /performance, un signal par actif et par semaine
+            if not any(x["ticker"] == t and x["date"] >= limite for x in d["journal"]):
+                d["journal"].append({"ticker": t, "date": dt.date.today().isoformat(),
+                                     "prix": a["price"]})
+        save(d)
+    except Exception as exc:  # ne jamais tuer la boucle
+        print("Erreur alertes :", exc)
+
+
+@tasks.loop(minutes=20)
+async def surveillance():
+    """Alertes de prix et signaux de vente sur les positions enregistrées."""
+    chan = bot.get_channel(CHANNEL_ID)
+    if chan is None:
+        return
+    try:
+        d = load()
+        tick = [a["ticker"] for a in d["alertes"]] + \
+               [x["ticker"] for lst in d["positions"].values() for x in lst]
+        if not tick:
+            return
+        data, ctx = await get_data(tick), await get_ctx()
+        restantes = []
+        for al in d["alertes"]:
+            df = data.get(al["ticker"])
+            prix = float(df["Close"].iloc[-1]) if df is not None else None
+            if prix and ((al["sens"] == "haut" and prix >= al["seuil"]) or
+                         (al["sens"] == "bas" and prix <= al["seuil"])):
+                e = discord.Embed(color=0xF0B232, title=f"🔔  {al['ticker']} a franchi {fmt(al['seuil'])}",
+                                  description=f"Cours actuel : **{fmt(prix)}**")
+                e.set_footer(text=LEGAL_COURT)
+                await chan.send(content=f"<@{al['uid']}>", embed=e)
+            else:
+                restantes.append(al)
+        d["alertes"] = restantes
+        today = dt.date.today().isoformat()
+        for uid, lst in d["positions"].items():
+            for x in lst:
+                if x["ticker"] not in data or x.get("notif") == today:
+                    continue
+                a = analyse(data[x["ticker"]], kind(x["ticker"]), ctx)
+                pnl = a["price"] / x["prix"] - 1
+                etat = etat_position(pnl, a)
+                if etat.startswith(("🔴", "🟠")):
+                    x["notif"] = today
+                    e = discord.Embed(color=0xF23F43, title=f"⚠️  {x['ticker']} · position à revoir",
+                                      description=f"{etat}\nDepuis ton achat : **{pct(pnl)}** · "
+                                                  f"cours {fmt(a['price'])}")
+                    e.set_footer(text=LEGAL_COURT)
+                    await chan.send(content=f"<@{uid}>", embed=e)
+        save(d)
+    except Exception as exc:
+        print("Erreur surveillance :", exc)
+
+
+@alertes.before_loop
+@surveillance.before_loop
+async def _attente():
+    await bot.wait_until_ready()
+
+
+if __name__ == "__main__":
+    if not TOKEN:
+        raise SystemExit("DISCORD_TOKEN manquant dans le fichier .env")
+    bot.run(TOKEN)
