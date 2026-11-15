@@ -1,0 +1,59 @@
+name: Alertes Discord
+
+# Poste les signaux dans un salon Discord via un webhook, sans serveur à héberger.
+# Nécessite le secret DISCORD_WEBHOOK_URL (voir README, « Alertes seules avec GitHub Actions »).
+
+on:
+  schedule:
+    # GitHub planifie en UTC, sans heure d'été : deux déclenchements par créneau,
+    # le script ne garde que celui qui tombe juste à l'heure de Paris.
+    - cron: "15 7 * * *"    #  9h15 Paris en été
+    - cron: "15 8 * * *"    #  9h15 Paris en hiver
+    - cron: "45 13 * * *"   # 15h45 Paris en été
+    - cron: "45 14 * * *"   # 15h45 Paris en hiver
+    - cron: "30 18 * * *"   # 20h30 Paris en été
+    - cron: "30 19 * * *"   # 20h30 Paris en hiver
+  workflow_dispatch:
+    inputs:
+      contenu:
+        description: Contenu de l'alerte
+        type: choice
+        default: tout
+        options: [tout, crypto]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: alertes-discord
+  cancel-in-progress: false
+
+jobs:
+  alerte:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CRON: ${{ github.event.schedule }}
+      CONTENU: ${{ inputs.contenu }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Créneau à l'heure de Paris ?
+        id: creneau
+        run: echo "contenu=$(python alertes_webhook.py --creneau)" >> "$GITHUB_OUTPUT"
+
+      - name: Installer les dépendances
+        if: steps.creneau.outputs.contenu != 'non'
+        run: pip install -r requirements.txt
+
+      - name: Envoyer l'alerte
+        if: steps.creneau.outputs.contenu != 'non'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          BUDGET_MAX: ${{ vars.BUDGET_MAX }}
+        run: python alertes_webhook.py

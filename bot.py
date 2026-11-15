@@ -9,7 +9,10 @@ import asyncio
 import datetime as dt
 import io
 import json
+import logging
 import os
+import re
+import tempfile
 import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -28,15 +31,35 @@ matplotlib.use("Agg")
 from matplotlib.dates import DateFormatter  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("fibot")
+
 load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))      # salon des alertes
-GUILD_ID = int(os.getenv("GUILD_ID", "0"))          # optionnel : commandes dispo tout de suite
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))          # si renseigné : bot privé, toi seul peux l'utiliser
-BUDGET_MAX = float(os.getenv("BUDGET_MAX", "50"))   # euros max par achat
-TAUX_PFU = float(os.getenv("TAUX_PFU", "31.4"))     # flat tax en %, à vérifier chaque année
+
+
+def _env(nom: str, defaut: float, conv=int):
+    """Lit une variable d'environnement numérique ; vide ou absente = valeur par défaut."""
+    brut = (os.getenv(nom) or "").strip().replace(",", ".")
+    if not brut:
+        return conv(defaut)
+    try:
+        return conv(brut)
+    except ValueError:
+        raise SystemExit(f"{nom} invalide dans .env : « {brut} » (un nombre est attendu)")
+
+
+TOKEN = (os.getenv("DISCORD_TOKEN") or "").strip()
+CHANNEL_ID = _env("CHANNEL_ID", 0)                  # salon des alertes
+GUILD_ID = _env("GUILD_ID", 0)                      # optionnel : commandes dispo tout de suite
+OWNER_ID = _env("OWNER_ID", 0)                      # si renseigné : bot privé, toi seul peux l'utiliser
+BUDGET_MAX = _env("BUDGET_MAX", 50, float)          # euros max par achat
+TAUX_PFU = _env("TAUX_PFU", 31.4, float)            # flat tax en %, à vérifier chaque année
 PARIS = ZoneInfo("Europe/Paris")
-DATA_FILE = Path(__file__).with_name("data.json")
+# DATA_DIR permet de ranger data.json sur un volume persistant (Docker, hébergeur)
+DATA_FILE = Path(os.getenv("DATA_DIR") or Path(__file__).parent) / "data.json"
+MAX_ALERTES = 20        # alertes de prix par utilisateur
+MAX_WATCH = 60          # actifs ajoutés avec /suivre
+MAX_JOURNAL = 1000      # signaux conservés pour /performance
 
 # ---------------------------------------------------------------- univers suivi
 # Tickers au format Yahoo Finance. Un ticker introuvable est simplement ignoré.
@@ -61,7 +84,20 @@ LEGAL_COURT = "Signal automatique générique • Pas un conseil personnalisé �
 
 # ---------------------------------------------------------------- stockage
 def load() -> dict:
-    d = json.loads(DATA_FILE.read_text()) if DATA_FILE.exists() else {}
+    d = {}
+    if DATA_FILE.exists():
+        try:
+            d = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            # fichier abîmé : on le met de côté plutôt que de l'écraser ou de planter
+            copie = DATA_FILE.with_name(f"data.corrompu-{int(time.time())}.json")
+            log.error("data.json illisible (%s), copie conservée dans %s", exc, copie.name)
+            try:
+                DATA_FILE.replace(copie)
+            except OSError:
+                pass
+    if not isinstance(d, dict):
+        d = {}
     for k, v in (("consent", {}), ("positions", {}), ("alertes", []),
                  ("journal", []), ("watch", [])):
         d.setdefault(k, v)
@@ -69,7 +105,30 @@ def load() -> dict:
 
 
 def save(d: dict) -> None:
-    DATA_FILE.write_text(json.dumps(d, indent=2, ensure_ascii=False))
+    """Écriture atomique : un arrêt brutal ne laisse jamais un data.json à moitié écrit."""
+    DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=DATA_FILE.parent, prefix=".data-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, DATA_FILE)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def today() -> dt.date:
+    """Date du jour à Paris, quel que soit le fuseau du serveur qui héberge le bot."""
+    return dt.datetime.now(PARIS).date()
+
+
+TICKER_RE = re.compile(r"[A-Z0-9^][A-Z0-9.\-=^]{0,14}")
+
+
+def norm(ticker: str) -> str | None:
+    """Nettoie un symbole saisi par l'utilisateur ; None s'il n'a pas une forme valide."""
+    t = ticker.upper().strip()
+    return t if TICKER_RE.fullmatch(t) else None
 
 
 def all_tickers() -> list[str]:
@@ -86,8 +145,12 @@ def kind(t: str) -> str:
 
 # ---------------------------------------------------------------- données
 _cache: dict[str, tuple[float, pd.DataFrame]] = {}
+_echecs: dict[str, float] = {}            # tickers introuvables : pas de nouvel essai immédiat
 _ctx_cache: tuple[float, dict] = (0.0, {})
+_dl_lock = asyncio.Lock()                  # un seul téléchargement Yahoo à la fois
 CACHE_TTL = 15 * 60
+ECHEC_TTL = 2 * 60
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)   # très bavard ; on résume nous-mêmes
 
 
 def _download(tickers: list[str]) -> dict[str, pd.DataFrame]:
@@ -106,17 +169,38 @@ def _download(tickers: list[str]) -> dict[str, pd.DataFrame]:
 
 
 async def get_data(tickers: list[str]) -> dict[str, pd.DataFrame]:
-    now = time.time()
     tickers = list(dict.fromkeys(t.upper() for t in tickers))
-    missing = [t for t in tickers if t not in _cache or now - _cache[t][0] > CACHE_TTL]
-    if missing:
-        try:
-            fresh = await asyncio.to_thread(_download, missing)
-        except Exception as exc:
-            print("Téléchargement impossible :", exc)
-            fresh = {}
-        for t, df in fresh.items():
-            _cache[t] = (now, df)
+
+    def manquants() -> list[str]:
+        now = time.time()
+        return [t for t in tickers
+                if (t not in _cache or now - _cache[t][0] > CACHE_TTL)
+                and now - _echecs.get(t, 0) > ECHEC_TTL]
+
+    if manquants():
+        async with _dl_lock:
+            missing = manquants()      # une autre commande a pu les charger entre-temps
+            if missing:
+                try:
+                    fresh = await asyncio.to_thread(_download, missing)
+                except Exception as exc:
+                    log.warning("Téléchargement impossible (%s) : %s", ", ".join(missing), exc)
+                    fresh = None
+                # yfinance ne lève pas d'erreur quand Yahoo est injoignable : un lot entier
+                # revenu vide est traité comme une panne, pas comme des tickers inexistants.
+                if fresh is not None and not fresh and len(missing) > 1:
+                    log.warning("Yahoo Finance n'a rien renvoyé pour %d actifs (panne ou "
+                                "limitation ?)", len(missing))
+                    fresh = None
+                if fresh is not None:      # panne réseau : on réessaiera au prochain appel
+                    now = time.time()
+                    for t in missing:
+                        if t in fresh:
+                            _cache[t] = (now, fresh[t])
+                            _echecs.pop(t, None)
+                        else:
+                            _echecs[t] = now
+    # en cas de panne, on sert les dernières données connues plutôt que rien
     return {t: _cache[t][1] for t in tickers if t in _cache}
 
 
@@ -127,7 +211,7 @@ FNG_FR = {"Extreme Fear": "Peur extrême", "Fear": "Peur", "Neutral": "Neutre",
 async def get_ctx() -> dict:
     """Contexte de marché : sentiment crypto (Fear & Greed) et tendance des taux."""
     global _ctx_cache
-    if time.time() - _ctx_cache[0] < 3600:
+    if time.time() < _ctx_cache[0]:
         return _ctx_cache[1]
     ctx = {"fng": None, "taux": None}
     try:
@@ -137,11 +221,13 @@ async def get_ctx() -> dict:
                 ctx["fng"] = (int(d["value"]), FNG_FR.get(d["value_classification"],
                                                            d["value_classification"]))
     except Exception as exc:
-        print("Fear & Greed indisponible :", exc)
+        log.warning("Fear & Greed indisponible : %s", exc)
     tnx = (await get_data([TAUX_10ANS])).get(TAUX_10ANS)
     if tnx is not None and len(tnx) > 63:
         ctx["taux"] = float(tnx["Close"].iloc[-1] - tnx["Close"].iloc[-63])
-    _ctx_cache = (time.time(), ctx)
+    # contexte complet : valable 1 h ; incomplet : nouvel essai dans 5 min
+    complet = ctx["fng"] is not None and ctx["taux"] is not None
+    _ctx_cache = (time.time() + (3600 if complet else 300), ctx)
     return ctx
 
 
@@ -515,11 +601,16 @@ def autorise(inter: discord.Interaction) -> bool:
     return not OWNER_ID or inter.user.id == OWNER_ID
 
 
-async def envoyer_analyse(inter: discord.Interaction, ticker: str, ephemeral: bool):
-    data = await get_data([ticker])
+def introuvable(saisie: str) -> str:
+    return (f"Ticker `{saisie[:20]}` introuvable ou historique insuffisant. Utilise le symbole "
+            "Yahoo Finance, par exemple `NVDA`, `TTE.PA`, `BTC-EUR`.")
+
+
+async def envoyer_analyse(inter: discord.Interaction, saisie: str, ephemeral: bool):
+    ticker = norm(saisie)
+    data = await get_data([ticker]) if ticker else {}
     if ticker not in data:
-        return await inter.followup.send(
-            f"Ticker `{ticker}` introuvable ou historique insuffisant.", ephemeral=ephemeral)
+        return await inter.followup.send(introuvable(saisie), ephemeral=ephemeral)
     a = analyse(data[ticker], kind(ticker), await get_ctx())
     buf = await asyncio.to_thread(chart_analyse, ticker, data[ticker], a)
     await inter.followup.send(embed=embed_analyse(ticker, a), ephemeral=ephemeral,
@@ -545,8 +636,12 @@ class AlerteView(discord.ui.View):
 
     async def detail(self, inter: discord.Interaction):
         if not autorise(inter):
-            return await inter.response.send_message("Bot privé.", ephemeral=True)
+            return await inter.response.send_message("Ce bot est privé.", ephemeral=True)
+        if str(inter.user.id) not in load()["consent"]:
+            return await demander_consentement(inter)
         ticker = inter.data["values"][0]
+        if ticker == "—":
+            return await inter.response.send_message("Aucun actif dans cette alerte.", ephemeral=True)
         await inter.response.defer(ephemeral=True, thinking=True)
         await envoyer_analyse(inter, ticker, ephemeral=True)
 
@@ -568,6 +663,12 @@ class ConsentView(discord.ui.View):
             content="✅ Conditions acceptées. Relance ta commande.", embed=None, view=None)
 
 
+async def demander_consentement(inter: discord.Interaction):
+    await inter.response.send_message(
+        content="Avant la première utilisation, lis et accepte ces conditions :",
+        embed=embed_legal(), view=ConsentView(), ephemeral=True)
+
+
 class Tree(app_commands.CommandTree):
     """Contrôle d'accès : bot privé (OWNER_ID) + acceptation des mentions légales."""
 
@@ -578,33 +679,95 @@ class Tree(app_commands.CommandTree):
         nom = inter.command.name if inter.command else ""
         if nom in ("legal", "supprimer") or str(inter.user.id) in load()["consent"]:
             return True
-        await inter.response.send_message(
-            content="Avant la première utilisation, lis et accepte ces conditions :",
-            embed=embed_legal(), view=ConsentView(), ephemeral=True)
+        await demander_consentement(inter)
         return False
+
+    async def on_error(self, inter: discord.Interaction, error: app_commands.AppCommandError):
+        """Toute erreur imprévue est journalisée et l'utilisateur reçoit une réponse claire."""
+        if isinstance(error, app_commands.CheckFailure):
+            return
+        log.exception("Erreur dans /%s", inter.command.name if inter.command else "?",
+                      exc_info=error)
+        msg = "⚠️ Une erreur est survenue. Réessaie dans un instant."
+        try:
+            if inter.response.is_done():
+                await inter.followup.send(msg, ephemeral=True)
+            else:
+                await inter.response.send_message(msg, ephemeral=True)
+        except discord.HTTPException:
+            pass
 
 
 # ---------------------------------------------------------------- bot
 class Bot(discord.Client):
     def __init__(self):
-        super().__init__(intents=discord.Intents.default())
+        super().__init__(
+            intents=discord.Intents.default(),
+            allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
+            activity=discord.Activity(type=discord.ActivityType.watching, name="les marchés • /aide"))
         self.tree = Tree(self)
+        self._pret = False
 
     async def setup_hook(self):
         self.add_view(AlerteView())
         self.add_view(ConsentView())
-        if GUILD_ID:
-            g = discord.Object(id=GUILD_ID)
-            self.tree.copy_global_to(guild=g)
-            await self.tree.sync(guild=g)
-        else:
-            await self.tree.sync()
+        try:
+            if GUILD_ID:
+                g = discord.Object(id=GUILD_ID)
+                self.tree.copy_global_to(guild=g)
+                await self.tree.sync(guild=g)
+            else:
+                await self.tree.sync()
+                log.info("Commandes synchronisées globalement : elles peuvent mettre jusqu'à 1 h "
+                         "à apparaître. Renseigne GUILD_ID pour les avoir tout de suite.")
+        except discord.Forbidden:
+            log.error("Impossible d'enregistrer les commandes sur le serveur %s : le bot n'y est "
+                      "pas invité (ou sans le scope applications.commands), ou GUILD_ID est faux.",
+                      GUILD_ID)
         if CHANNEL_ID:
             alertes.start()
             surveillance.start()
+        else:
+            log.warning("CHANNEL_ID vide : alertes automatiques désactivées, commandes seules.")
 
     async def on_ready(self):
-        print(f"Connecté : {self.user}")
+        log.info("Connecté : %s • %d serveur(s)", self.user, len(self.guilds))
+        if self._pret:          # on_ready est rappelé à chaque reconnexion
+            return
+        self._pret = True
+        perms = discord.Permissions(view_channel=True, send_messages=True,
+                                    embed_links=True, attach_files=True)
+        log.info("Lien d'invitation : %s", discord.utils.oauth_url(
+            self.user.id, permissions=perms, scopes=("bot", "applications.commands")))
+        if CHANNEL_ID:
+            chan = await salon()
+            if chan is not None:
+                moi = chan.guild.me if getattr(chan, "guild", None) else None
+                p = chan.permissions_for(moi) if moi else None
+                if p and not (p.send_messages and p.embed_links and p.attach_files):
+                    log.error("Permissions manquantes dans #%s : il faut Envoyer des messages, "
+                              "Intégrer des liens et Joindre des fichiers.", chan)
+
+
+async def salon():
+    """Salon des alertes ; None (avec un message clair dans les logs) s'il est inaccessible."""
+    chan = bot.get_channel(CHANNEL_ID)
+    if chan is None:
+        try:
+            chan = await bot.fetch_channel(CHANNEL_ID)
+        except discord.HTTPException as exc:
+            log.error("Salon CHANNEL_ID=%s inaccessible (%s). Vérifie l'identifiant et que le bot "
+                      "voit ce salon.", CHANNEL_ID, exc)
+            return None
+    return chan
+
+
+async def ac_ticker(inter: discord.Interaction, courant: str) -> list[app_commands.Choice[str]]:
+    """Suggestions pendant la saisie : actifs suivis (la saisie libre reste possible)."""
+    c = courant.upper().strip()
+    connus = all_tickers()
+    choix = [t for t in connus if t.startswith(c)] + [t for t in connus if c in t and not t.startswith(c)]
+    return [app_commands.Choice(name=t, value=t) for t in choix[:25]]
 
 
 bot = Bot()
@@ -613,9 +776,10 @@ THEME_CHOICES = [app_commands.Choice(name=k, value=k) for k in THEMES]
 
 @bot.tree.command(name="analyse", description="Analyse complète d'un actif avec graphique")
 @app_commands.describe(ticker="Symbole Yahoo Finance, ex : NVDA, TTE.PA, BTC-EUR, URW.PA")
+@app_commands.autocomplete(ticker=ac_ticker)
 async def analyse_cmd(inter: discord.Interaction, ticker: str):
     await inter.response.defer()
-    await envoyer_analyse(inter, ticker.upper().strip(), ephemeral=False)
+    await envoyer_analyse(inter, ticker, ephemeral=False)
 
 
 @bot.tree.command(description="Les meilleurs signaux du moment, tous thèmes ou un seul")
@@ -649,12 +813,13 @@ async def marche(inter: discord.Interaction):
 
 @bot.tree.command(description="Simule un investissement mensuel régulier (DCA) sur 2 ans")
 @app_commands.describe(ticker="Symbole", mensuel="Montant investi chaque mois en €")
+@app_commands.autocomplete(ticker=ac_ticker)
 async def dca(inter: discord.Interaction, ticker: str, mensuel: float = 50.0):
     await inter.response.defer()
-    ticker = ticker.upper().strip()
-    data = await get_data([ticker])
+    saisie, ticker = ticker, norm(ticker)
+    data = await get_data([ticker]) if ticker else {}
     if ticker not in data:
-        return await inter.followup.send(f"Ticker `{ticker}` introuvable.")
+        return await inter.followup.send(introuvable(saisie))
     mensuel = min(max(mensuel, 1), BUDGET_MAX)
     close = data[ticker]["Close"].astype(float)
     achats = close.groupby([close.index.year, close.index.month]).first()
@@ -672,7 +837,11 @@ async def dca(inter: discord.Interaction, ticker: str, mensuel: float = 50.0):
 
 @bot.tree.command(description="Enregistre un achat pour suivre ta position")
 @app_commands.describe(ticker="Symbole", prix="Prix d'achat unitaire", montant="Montant investi en €")
+@app_commands.autocomplete(ticker=ac_ticker)
 async def achat(inter: discord.Interaction, ticker: str, prix: float, montant: float):
+    saisie, ticker = ticker, norm(ticker)
+    if not ticker:
+        return await inter.response.send_message(introuvable(saisie), ephemeral=True)
     if montant > BUDGET_MAX:
         return await inter.response.send_message(
             f"Ta règle : {BUDGET_MAX:.0f} € max par achat. Achat non enregistré.", ephemeral=True)
@@ -680,22 +849,25 @@ async def achat(inter: discord.Interaction, ticker: str, prix: float, montant: f
         return await inter.response.send_message("Prix et montant doivent être positifs.", ephemeral=True)
     d = load()
     d["positions"].setdefault(str(inter.user.id), []).append(
-        {"ticker": ticker.upper().strip(), "prix": prix, "montant": montant,
-         "date": dt.date.today().isoformat()})
+        {"ticker": ticker, "prix": prix, "montant": montant, "date": today().isoformat()})
     save(d)
     await inter.response.send_message(
-        f"✅ Achat noté : {montant:.0f} € de {ticker.upper()} à {fmt(prix)}.", ephemeral=True)
+        f"✅ Achat noté : {montant:.0f} € de {ticker} à {fmt(prix)}.", ephemeral=True)
 
 
 @bot.tree.command(description="Retire une position (vendue)")
 async def vente(inter: discord.Interaction, ticker: str):
-    d, uid, t = load(), str(inter.user.id), ticker.upper().strip()
-    avant = len(d["positions"].get(uid, []))
-    d["positions"][uid] = [x for x in d["positions"].get(uid, []) if x["ticker"] != t]
+    d, uid, t = load(), str(inter.user.id), ticker.upper().strip()[:20]
+    avant = d["positions"].get(uid, [])
+    apres = [x for x in avant if x["ticker"] != t]
+    if len(apres) == len(avant):
+        return await inter.response.send_message(f"Aucune position sur {t}.", ephemeral=True)
+    if apres:
+        d["positions"][uid] = apres
+    else:
+        d["positions"].pop(uid, None)
     save(d)
-    await inter.response.send_message(
-        f"✅ {t} retiré." if len(d["positions"][uid]) < avant else f"Aucune position sur {t}.",
-        ephemeral=True)
+    await inter.response.send_message(f"✅ {t} retiré.", ephemeral=True)
 
 
 def etat_position(pnl: float, a: dict) -> str:
@@ -746,14 +918,23 @@ async def positions(inter: discord.Interaction):
 
 @bot.tree.command(description="Crée une alerte de prix : le bot te prévient quand le seuil est franchi")
 @app_commands.describe(ticker="Symbole", seuil="Prix à surveiller")
+@app_commands.autocomplete(ticker=ac_ticker)
 async def alerte(inter: discord.Interaction, ticker: str, seuil: float):
     await inter.response.defer(ephemeral=True)
-    ticker = ticker.upper().strip()
-    data = await get_data([ticker])
+    if not CHANNEL_ID:
+        return await inter.followup.send("Les alertes de prix nécessitent un salon : `CHANNEL_ID` "
+                                         "n'est pas configuré sur ce bot.")
+    if seuil <= 0:
+        return await inter.followup.send("Le seuil doit être positif.")
+    saisie, ticker = ticker, norm(ticker)
+    data = await get_data([ticker]) if ticker else {}
     if ticker not in data:
-        return await inter.followup.send(f"Ticker `{ticker}` introuvable.")
+        return await inter.followup.send(introuvable(saisie))
     prix = float(data[ticker]["Close"].iloc[-1])
     d = load()
+    if sum(a["uid"] == inter.user.id for a in d["alertes"]) >= MAX_ALERTES:
+        return await inter.followup.send(
+            f"Tu as déjà {MAX_ALERTES} alertes actives. Retires-en avec `/stopalerte`.")
     d["alertes"].append({"uid": inter.user.id, "ticker": ticker, "seuil": seuil,
                          "sens": "haut" if seuil > prix else "bas"})
     save(d)
@@ -761,15 +942,32 @@ async def alerte(inter: discord.Interaction, ticker: str, seuil: float):
         f"🔔 Alerte créée : {ticker} {'≥' if seuil > prix else '≤'} {fmt(seuil)} (cours actuel {fmt(prix)}).")
 
 
+@bot.tree.command(description="Supprime tes alertes de prix sur un actif")
+@app_commands.describe(ticker="Symbole dont tu veux retirer les alertes")
+async def stopalerte(inter: discord.Interaction, ticker: str):
+    d, t = load(), ticker.upper().strip()[:20]
+    garde = [a for a in d["alertes"] if not (a["uid"] == inter.user.id and a["ticker"] == t)]
+    n = len(d["alertes"]) - len(garde)
+    if n:
+        d["alertes"] = garde
+        save(d)
+    await inter.response.send_message(
+        f"🔕 {n} alerte(s) supprimée(s) sur {t}." if n else f"Aucune alerte sur {t}.", ephemeral=True)
+
+
 @bot.tree.command(description="Ajoute un actif à la liste suivie par les alertes")
 async def suivre(inter: discord.Interaction, ticker: str):
     await inter.response.defer(ephemeral=True)
-    ticker = ticker.upper().strip()
-    if ticker not in await get_data([ticker]):
-        return await inter.followup.send(f"Ticker `{ticker}` introuvable.")
+    saisie, ticker = ticker, norm(ticker)
+    if not ticker or ticker not in await get_data([ticker]):
+        return await inter.followup.send(introuvable(saisie))
     d = load()
-    if ticker not in d["watch"]:
-        d["watch"].append(ticker); save(d)
+    if ticker in all_tickers():
+        return await inter.followup.send(f"{ticker} est déjà suivi.")
+    if len(d["watch"]) >= MAX_WATCH:
+        return await inter.followup.send(f"Liste pleine ({MAX_WATCH} actifs ajoutés).")
+    d["watch"].append(ticker)
+    save(d)
     await inter.followup.send(f"✅ {ticker} est maintenant suivi.")
 
 
@@ -855,7 +1053,7 @@ async def themes(inter: discord.Interaction):
 async def aide(inter: discord.Interaction):
     e = discord.Embed(title="📖  Commandes", color=0x5865F2, description=(
         "**Signaux**\n`/top` · `/analyse` · `/marche` · `/themes` · `/suivre`\n\n"
-        "**Ton portefeuille**\n`/achat` · `/vente` · `/positions` · `/alerte`\n\n"
+        "**Ton portefeuille**\n`/achat` · `/vente` · `/positions` · `/alerte` · `/stopalerte`\n\n"
         "**Outils**\n`/dca` · `/performance` · `/fiscalite`\n\n"
         "**Légal et données**\n`/legal` · `/mesdonnees` · `/supprimer`"))
     await inter.response.send_message(embed=e, ephemeral=True)
@@ -866,7 +1064,7 @@ async def aide(inter: discord.Interaction):
                   dt.time(20, 30, tzinfo=PARIS)])
 async def alertes():
     """9h15 ouverture Paris, 15h45 ouverture US, 20h30 point crypto. Week-end : crypto seule."""
-    chan = bot.get_channel(CHANNEL_ID)
+    chan = await salon()
     if chan is None:
         return
     now = dt.datetime.now(PARIS)
@@ -876,22 +1074,24 @@ async def alertes():
             "Point crypto" if crypto_seule else "Signaux du marché",
             THEMES["crypto"] if crypto_seule else all_tickers())
         await chan.send(embed=e, view=vue, **({"file": f} if f else {}))
-        d, limite = load(), (dt.date.today() - dt.timedelta(days=7)).isoformat()
+        d, limite = load(), (today() - dt.timedelta(days=7)).isoformat()
         for t, a in achats:      # journal pour /performance, un signal par actif et par semaine
             if not any(x["ticker"] == t and x["date"] >= limite for x in d["journal"]):
-                d["journal"].append({"ticker": t, "date": dt.date.today().isoformat(),
+                d["journal"].append({"ticker": t, "date": today().isoformat(),
                                      "prix": a["price"]})
+        d["journal"] = d["journal"][-MAX_JOURNAL:]
         save(d)
-    except Exception as exc:  # ne jamais tuer la boucle
-        print("Erreur alertes :", exc)
+    except Exception:  # ne jamais tuer la boucle
+        log.exception("Erreur pendant l'alerte automatique")
 
 
 @tasks.loop(minutes=20)
 async def surveillance():
     """Alertes de prix et signaux de vente sur les positions enregistrées."""
-    chan = bot.get_channel(CHANNEL_ID)
+    chan = await salon()
     if chan is None:
         return
+    parties, notifiees = [], []      # ce qui a réellement été envoyé pendant ce passage
     try:
         d = load()
         tick = [a["ticker"] for a in d["alertes"]] + \
@@ -899,7 +1099,6 @@ async def surveillance():
         if not tick:
             return
         data, ctx = await get_data(tick), await get_ctx()
-        restantes = []
         for al in d["alertes"]:
             df = data.get(al["ticker"])
             prix = float(df["Close"].iloc[-1]) if df is not None else None
@@ -909,27 +1108,38 @@ async def surveillance():
                                   description=f"Cours actuel : **{fmt(prix)}**")
                 e.set_footer(text=LEGAL_COURT)
                 await chan.send(content=f"<@{al['uid']}>", embed=e)
-            else:
-                restantes.append(al)
-        d["alertes"] = restantes
-        today = dt.date.today().isoformat()
+                parties.append(al)
+        jour = today().isoformat()
         for uid, lst in d["positions"].items():
             for x in lst:
-                if x["ticker"] not in data or x.get("notif") == today:
+                if x["ticker"] not in data or x.get("notif") == jour:
                     continue
                 a = analyse(data[x["ticker"]], kind(x["ticker"]), ctx)
                 pnl = a["price"] / x["prix"] - 1
                 etat = etat_position(pnl, a)
                 if etat.startswith(("🔴", "🟠")):
-                    x["notif"] = today
                     e = discord.Embed(color=0xF23F43, title=f"⚠️  {x['ticker']} · position à revoir",
                                       description=f"{etat}\nDepuis ton achat : **{pct(pnl)}** · "
                                                   f"cours {fmt(a['price'])}")
                     e.set_footer(text=LEGAL_COURT)
                     await chan.send(content=f"<@{uid}>", embed=e)
-        save(d)
-    except Exception as exc:
-        print("Erreur surveillance :", exc)
+                    notifiees.append((uid, {k: v for k, v in x.items() if k != "notif"}))
+    except Exception:
+        log.exception("Erreur pendant la surveillance")
+    finally:
+        # On relit le fichier avant d'écrire : une commande (/achat, /alerte…) a pu le modifier
+        # pendant les téléchargements, et il ne faut pas écraser ce qu'elle a enregistré.
+        # Ce qui est déjà parti est noté même si un envoi suivant a échoué.
+        if parties or notifiees:
+            d, jour = load(), today().isoformat()
+            for al in parties:
+                if al in d["alertes"]:
+                    d["alertes"].remove(al)
+            for uid, ref in notifiees:
+                for x in d["positions"].get(uid, []):
+                    if {k: v for k, v in x.items() if k != "notif"} == ref:
+                        x["notif"] = jour
+            save(d)
 
 
 @alertes.before_loop
@@ -940,5 +1150,9 @@ async def _attente():
 
 if __name__ == "__main__":
     if not TOKEN:
-        raise SystemExit("DISCORD_TOKEN manquant dans le fichier .env")
-    bot.run(TOKEN)
+        raise SystemExit("DISCORD_TOKEN manquant : copie .env.example en .env et colle ton token.")
+    try:
+        bot.run(TOKEN, log_handler=None)
+    except discord.LoginFailure:
+        raise SystemExit("Token refusé par Discord : régénère-le (onglet Bot → Reset Token) "
+                         "et mets-le à jour dans .env.")

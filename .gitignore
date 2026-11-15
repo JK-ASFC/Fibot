@@ -4,3 +4,6 @@ positions.json
 __pycache__/
 *.pyc
 .venv/
+data.corrompu-*.json
+.data-*.tmp
+.pytest_cache/
