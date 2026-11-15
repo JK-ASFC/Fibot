@@ -124,3 +124,58 @@ def test_etat_position():
     assert bot.etat_position(-0.20, a).startswith("🔴")
     assert bot.etat_position(0.05, {**a, "score": -25}).startswith("🟠")
     assert bot.etat_position(0.05, {**a, "score": 0, "montant": 0}) == "🟡 CONSERVER"
+
+
+# ------------------------------------------------------------ mode webhook (GitHub Actions)
+import datetime as dt  # noqa: E402
+
+import alertes_webhook as aw  # noqa: E402
+
+UTC = dt.timezone.utc
+
+
+@pytest.mark.parametrize("cron,jour,attendu", [
+    ("15 7 * * *", dt.datetime(2026, 7, 1, 7, 40, tzinfo=UTC), "tout"),      # été, mercredi, retard
+    ("15 8 * * *", dt.datetime(2026, 7, 1, 8, 15, tzinfo=UTC), "non"),       # été : 10h15, doublon
+    ("15 7 * * *", dt.datetime(2026, 12, 1, 7, 15, tzinfo=UTC), "non"),      # hiver : 8h15
+    ("15 8 * * *", dt.datetime(2026, 12, 1, 8, 15, tzinfo=UTC), "tout"),     # hiver, mardi
+    ("45 13 * * *", dt.datetime(2026, 7, 1, 13, 45, tzinfo=UTC), "tout"),
+    ("30 18 * * *", dt.datetime(2026, 7, 1, 18, 30, tzinfo=UTC), "crypto"),  # 20h30 : crypto
+    ("30 19 * * *", dt.datetime(2026, 12, 1, 19, 30, tzinfo=UTC), "crypto"),
+    ("15 7 * * *", dt.datetime(2026, 7, 4, 7, 15, tzinfo=UTC), "crypto"),    # samedi
+])
+def test_creneau_heure_de_paris(cron, jour, attendu):
+    assert aw.contenu_du_creneau(cron, jour) == attendu
+
+
+def test_contenu_demande(monkeypatch):
+    monkeypatch.setenv("CRON", "")
+    monkeypatch.setenv("CONTENU", "")
+    assert aw.contenu_demande() == "tout"
+    monkeypatch.setenv("CONTENU", "crypto")
+    assert aw.contenu_demande() == "crypto"
+
+
+def test_webhook_construit_une_alerte(monkeypatch):
+    monkeypatch.setattr(bot, "_download", lambda ts: {
+        t: serie(pente=0.003, seed=i) for i, t in enumerate(ts)})
+
+    async def ctx():
+        return {"fng": (20, "Peur extrême"), "taux": -0.4}
+    monkeypatch.setattr(bot, "get_ctx", ctx)
+    e, fichier = asyncio.run(aw.construire("tout"))
+    assert e.title.endswith("Signaux du marché") and len(e) <= 6000
+    assert "/legal" not in e.footer.text and "Pas un conseil" in e.footer.text
+    assert fichier is not None and fichier.filename == "top.png"
+    e, _ = asyncio.run(aw.construire("crypto"))
+    assert e.title.endswith("Point crypto")
+
+
+def test_webhook_refuse_d_envoyer_sans_cours(monkeypatch):
+    monkeypatch.setattr(bot, "_download", lambda ts: {})
+
+    async def sans_attente(_):
+        return None
+    monkeypatch.setattr(aw.asyncio, "sleep", sans_attente)
+    with pytest.raises(RuntimeError, match="Cours indisponibles"):
+        asyncio.run(aw.construire("crypto"))

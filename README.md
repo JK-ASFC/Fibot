@@ -57,6 +57,35 @@ Le bot ne fonctionne que tant que ce programme tourne. Pour recevoir les alertes
 
 Tes positions, alertes et acceptations sont dans `data.json` (ou dans le volume Docker `fibot-data`). Sauvegarde ce fichier si tu changes de machine. Sur un hébergeur à disque éphémère, monte un volume persistant et pointe `DATA_DIR` dessus.
 
+## Alertes seules avec GitHub Actions (sans hébergement)
+
+Si tu veux seulement recevoir les signaux dans un salon, sans rien héberger : le workflow `.github/workflows/alertes.yml` les calcule sur les serveurs de GitHub et les poste via un webhook. Pas besoin de créer d'application Discord ni de token.
+
+| | Bot complet (`bot.py`) | Alertes seules (workflow) |
+|---|---|---|
+| Alertes 9h15 / 15h45 / 20h30 | oui | oui, avec parfois quelques minutes de retard |
+| Commandes `/analyse`, `/top`, `/dca`… | oui | non |
+| Positions, alertes de prix, `/performance` | oui | non |
+| Menu de détail sous les alertes | oui | non |
+| Machine allumée en permanence | nécessaire | inutile |
+
+Mise en place :
+
+1. **Créer le webhook** : sur Discord, clic droit sur le salon → **Modifier le salon** → **Intégrations** → **Webhooks** → **Nouveau webhook** → **Copier l'URL du webhook**. Cette URL permet d'écrire dans le salon : ne la publie pas.
+2. **L'enregistrer sur GitHub** : dans le dépôt, **Settings → Secrets and variables → Actions → New repository secret**, nom `DISCORD_WEBHOOK_URL`, valeur l'URL copiée.
+3. **Tester** : onglet **Actions** → **Alertes Discord** → **Run workflow**. L'alerte doit arriver dans le salon en une à deux minutes.
+
+Ensuite les envois sont automatiques, aux mêmes horaires que le bot (heure de Paris, été comme hiver ; week-end et soir : crypto seule).
+
+À savoir :
+
+- Les envois planifiés ne fonctionnent que si le workflow est sur la **branche par défaut** (`main`).
+- Pour changer le montant maximum par achat : **Settings → Secrets and variables → Actions → Variables**, variable `BUDGET_MAX`.
+- Si Yahoo Finance ne répond pas, le workflow échoue (GitHub t'envoie un e-mail) au lieu de poster une alerte vide.
+- Sur un dépôt public, GitHub suspend les workflows planifiés après 60 jours sans activité sur le dépôt : un clic sur **Enable workflow** les relance.
+- N'utilise pas les deux modes sur le même salon, tu recevrais chaque alerte en double.
+- Le salon reçoit les signaux sans étape d'acceptation des mentions légales : garde-le privé si l'usage est personnel (voir le cadre légal plus bas).
+
 ### Ça ne marche pas ?
 
 | Symptôme | Cause probable |
