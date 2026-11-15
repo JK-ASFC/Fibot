@@ -42,7 +42,7 @@ def contenu_demande() -> str:
 
 
 async def construire(contenu: str):
-    """Embed + image de l'alerte. Lève RuntimeError si les cours sont indisponibles."""
+    """Messages de l'alerte (embed, fichier). Lève RuntimeError si les cours sont indisponibles."""
     import bot      # import tardif : la vérification du créneau n'a pas besoin des dépendances
 
     crypto = contenu == "crypto"
@@ -58,11 +58,11 @@ async def construire(contenu: str):
         # Sans cours, l'alerte afficherait « aucun signal » à tort : mieux vaut échouer clairement.
         raise RuntimeError(f"Cours indisponibles ({len(data)}/{len(tickers)} actifs reçus) : "
                            "Yahoo Finance est injoignable ou limite cette machine.")
-    e, fichier, _vue, _achats = await bot.build_alerte(
+    messages, _vue, _achats = await bot.build_alerte(
         "Point crypto" if crypto else "Signaux du marché", tickers)
-    # pas de commandes en mode webhook : on retire le renvoi vers /legal
-    e.set_footer(text=(e.footer.text or "").replace(" • /legal", ""))
-    return e, fichier
+    for e, _ in messages:      # pas de commandes en mode webhook : on retire le renvoi vers /legal
+        e.set_footer(text=(e.footer.text or "").replace(" • /legal", ""))
+    return messages
 
 
 async def main() -> int:
@@ -80,7 +80,7 @@ async def main() -> int:
     import discord
 
     try:
-        e, fichier = await construire(contenu)
+        messages = await construire(contenu)
     except RuntimeError as exc:
         print(exc, file=sys.stderr)
         return 1
@@ -92,7 +92,9 @@ async def main() -> int:
                   "(https://discord.com/api/webhooks/…).", file=sys.stderr)
             return 1
         try:
-            await webhook.send(embed=e, username="Fibot", **({"file": fichier} if fichier else {}))
+            for e, fichier in messages:
+                await webhook.send(embed=e, username="Fibot", wait=True,
+                                   **({"file": fichier} if fichier else {}))
         except discord.NotFound:
             print("Webhook introuvable : il a été supprimé ou l'URL est incomplète.", file=sys.stderr)
             return 1

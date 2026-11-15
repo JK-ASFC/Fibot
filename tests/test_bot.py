@@ -163,12 +163,47 @@ def test_webhook_construit_une_alerte(monkeypatch):
     async def ctx():
         return {"fng": (20, "Peur extrême"), "taux": -0.4}
     monkeypatch.setattr(bot, "get_ctx", ctx)
-    e, fichier = asyncio.run(aw.construire("tout"))
-    assert e.title.endswith("Signaux du marché") and len(e) <= 6000
-    assert "/legal" not in e.footer.text and "Pas un conseil" in e.footer.text
-    assert fichier is not None and fichier.filename == "top.png"
-    e, _ = asyncio.run(aw.construire("crypto"))
-    assert e.title.endswith("Point crypto")
+    monkeypatch.setattr(bot, "_ctx_cache", (0.0, {}))
+    messages = asyncio.run(aw.construire("tout"))
+    marche, achats, ventes = messages[0][0], messages[1][0], messages[-1][0]
+    assert marche.title.endswith("Signaux du marché") and "En bref" in marche.description
+    assert any("Évolution des marchés" in f.name for f in marche.fields)
+    assert "Quoi faire" in achats.title and "Mise indicative" in achats.description
+    assert "Stop" in achats.description and "Pourquoi" in achats.description
+    assert any("Comment lire" in f.name for f in ventes.fields)
+    assert [f.filename for _, f in messages if f] == ["top.png"]
+    for e, _ in messages:
+        assert len(e) <= 6000 and len(e.description) <= 4096
+        assert all(len(f.value) <= 1024 for f in e.fields)
+        assert "/legal" not in e.footer.text and "Pas un conseil" in e.footer.text
+    messages = asyncio.run(aw.construire("crypto"))
+    assert messages[0][0].title.endswith("Point crypto")
+
+
+def test_alerte_sans_aucun_signal(monkeypatch):
+    plat = serie(pente=0.0, bruit=0.0001)
+    monkeypatch.setattr(bot, "_download", lambda ts: {t: plat for t in ts})
+
+    async def ctx():
+        return {"fng": None, "taux": None}
+    monkeypatch.setattr(bot, "get_ctx", ctx)
+    messages, _, achats = asyncio.run(bot.build_alerte("Test", ["AAA", "BBB"]))
+    if not achats:
+        assert "rien à acheter" in messages[1][0].title and messages[1][1] is None
+
+
+def test_pages_ne_perd_aucun_bloc():
+    blocs = [f"bloc {i} " + "x" * 900 for i in range(9)]
+    pages = bot._pages(blocs)
+    assert len(pages) > 1 and all(len(p) <= 4096 for p in pages)
+    assert all(any(f"bloc {i} " in p for p in pages) for i in range(9))
+
+
+def test_noms_et_devises():
+    assert bot.nom("AAPL") == "**Apple** (`AAPL`)" and bot.nom("XYZ") == "**XYZ**"
+    assert [bot.devise(t) for t in ("AAPL", "TTE.PA", "BTC-EUR", "BTC-USD", "^FCHI")] == \
+        ["$", "€", "€", "$", ""]
+    assert set(bot.NOMS) >= {t for lst in bot.THEMES.values() for t in lst}
 
 
 def test_webhook_refuse_d_envoyer_sans_cours(monkeypatch):

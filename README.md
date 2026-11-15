@@ -4,7 +4,7 @@
 
 ![Aperçu d'une analyse](docs/apercu-analyse.png)
 
-*Aperçus générés avec des données simulées.*
+*Aperçus générés avec des données simulées. L'alerte a depuis été découpée en trois messages plus détaillés (voir « Automatismes »).*
 
 ## Mise en route (10 minutes)
 
@@ -123,6 +123,14 @@ Les tests tournent hors ligne (données simulées), sans token.
 | `/legal` `/mesdonnees` `/supprimer` | Mentions légales, export et effacement de tes données |
 
 ## Automatismes
+
+Chaque alerte arrive en trois messages rédigés en langage courant :
+
+1. **Évolution des marchés** : un résumé « en bref », la variation des grands indices et le climat (sentiment crypto, taux d'intérêt), chaque ligne expliquée.
+2. **Quoi faire** : pour chaque signal d'achat, la mise, le cours, le stop, l'objectif et les raisons du signal.
+3. **Si tu en possèdes** : les actifs à vendre ou alléger, avec les raisons, puis un rappel « comment lire ces alertes ».
+
+Horaires :
 
 - **9h15** (ouverture Paris) et **15h45** (ouverture US) : signaux tous thèmes.
 - **20h30** et week-end : point crypto (marché ouvert 24h/24).
