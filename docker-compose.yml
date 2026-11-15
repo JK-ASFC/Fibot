@@ -1,0 +1,10 @@
+services:
+  fibot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - fibot-data:/data
+
+volumes:
+  fibot-data:
